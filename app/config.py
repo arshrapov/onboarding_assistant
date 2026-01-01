@@ -41,9 +41,19 @@ class Settings(BaseSettings):
     
     # LLM settings
     gemini_model: str = "gemini-1.5-flash"
-    embedding_model: str = "models/embedding-001"
     max_tokens: int = 8192
     temperature: float = 0.7
+
+    # Embedding settings
+    embedding_provider: str = "gemini"  # Options: "gemini", "sentence-transformers"
+    embedding_model: str = "models/embedding-001"  # Gemini embedding model
+    sentence_transformer_model: str = "all-MiniLM-L6-v2"  # SentenceTransformer model name
+
+    # ChromaDB settings
+    chroma_mode: str = "embedded"  # "embedded" or "server"
+    chroma_host: str = "chromadb"  # Docker service name or hostname
+    chroma_port: int = 8000
+    chroma_collection_prefix: str = "onboarding_"  # Prefix for collection names
 
     class Config:
         env_file = ".env"

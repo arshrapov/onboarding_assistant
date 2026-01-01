@@ -1,12 +1,12 @@
 """
 Main application entry point for the Onboarding Assistant.
-Initializes FastAPI application with repository management endpoints.
+Initializes FastAPI application with onboarding workflow endpoints.
 """
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import router as repositories_router
+from app.api.onboarding_routes import router as onboarding_router
 from app.config import settings
 
 
@@ -19,8 +19,8 @@ def create_app() -> FastAPI:
     """
     app = FastAPI(
         title="Onboarding Assistant API",
-        description="API for managing GitHub repository cloning and code analysis",
-        version="0.1.0",
+        description="AI-powered repository onboarding with RAG (Retrieval-Augmented Generation)",
+        version="1.0.0",
         docs_url="/docs",
         redoc_url="/redoc",
     )
@@ -35,7 +35,7 @@ def create_app() -> FastAPI:
     )
 
     # Include routers
-    app.include_router(repositories_router)
+    app.include_router(onboarding_router)
 
     return app
 
@@ -50,8 +50,12 @@ async def root():
     return {
         "status": "running",
         "service": "Onboarding Assistant API",
-        "version": "0.1.0",
-        "docs": "/docs"
+        "version": "1.0.0",
+        "docs": "/docs",
+        "endpoints": {
+            "onboarding": "/api/v1/onboarding",
+            "health": "/health"
+        }
     }
 
 

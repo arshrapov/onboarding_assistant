@@ -6,6 +6,7 @@ chromadb==0.4.22
 
 # LLM and embeddings
 google-generativeai==0.3.2
+sentence-transformers==2.2.2
 
 # Data validation and settings
 pydantic==2.5.3
