@@ -14,10 +14,28 @@ from app.core.exceptions import OnboardingError, StateTransitionError
 from app.services.state_machine import OnboardingStateMachine
 from app.services.repo_downloader import RepositoryDownloader
 from app.services.rag_engine import RAGEngine
+from app.services.llm_router import LLMRouter
 from app.services.vector_store import create_collection_name
 from app.utils.file_filter import filter_repository_files, count_files_by_language
 from app.utils.file_parser import parse_file
 from app.config import settings
+
+
+# Special files to collect for overview generation
+OVERVIEW_FILES = {
+    # README files
+    'readme.md', 'readme.rst', 'readme.txt', 'readme',
+    # Package/dependency files
+    'requirements.txt', 'pyproject.toml', 'setup.py', 'pipfile',
+    'package.json', 'package-lock.json', 'yarn.lock',
+    'cargo.toml', 'go.mod', 'go.sum',
+    'pom.xml', 'build.gradle', 'build.gradle.kts',
+    'gemfile', 'gemfile.lock',
+    # Configuration files
+    'dockerfile', '.dockerignore',
+    'makefile', 'cmakelists.txt',
+    '.env.example', 'config.yaml', 'config.yml', 'config.json',
+}
 
 
 class RepositoryOnboardingService:
@@ -29,6 +47,7 @@ class RepositoryOnboardingService:
         self.jobs_file = Path(settings.cache_dir) / "onboarding_jobs.json"
         self.downloader = RepositoryDownloader()
         self.rag_engine = RAGEngine()
+        self.llm_router = LLMRouter()
 
         self._ensure_cache_dir()
         self._load_jobs()
@@ -139,6 +158,10 @@ class RepositoryOnboardingService:
             if job.current_state == OnboardingState.PARSING:
                 await self._handle_parsing(job, state_machine)
 
+            # State: GENERATING_OVERVIEW
+            if job.current_state == OnboardingState.GENERATING_OVERVIEW:
+                await self._handle_generating_overview(job, state_machine)
+
         except Exception as e:
             self._handle_error(job, state_machine, e)
 
@@ -204,6 +227,16 @@ class RepositoryOnboardingService:
 
             for file_path in files:
                 try:
+                    # Collect metadata for overview generation (passive collection)
+                    if self._is_overview_file(file_path, repo_path):
+                        try:
+                            content = file_path.read_text(encoding='utf-8', errors='ignore')
+                            relative_path = str(file_path.relative_to(repo_path))
+                            job.metadata_for_overview[relative_path] = content
+                        except Exception as e:
+                            # Silently skip files that can't be read
+                            pass
+
                     # Parse file
                     chunks = await loop.run_in_executor(
                         None,
@@ -213,7 +246,7 @@ class RepositoryOnboardingService:
                         job.repo_url
                     )
 
-                    
+
                     chunk_batch.extend(chunks)
                     total_chunks += len(chunks)
                     processed_files += 1
@@ -255,15 +288,270 @@ class RepositoryOnboardingService:
                 "chunks_created": total_chunks,
                 "chunks_indexed": total_chunks,
                 "failed_files": len(job.failed_files),
-                "languages": language_counts
+                "languages": language_counts,
+                "overview_files_collected": len(job.metadata_for_overview)
             })
 
-            # Transition directly to completed (no separate indexing state)
-            sm.transition_to(OnboardingState.COMPLETED)
+            # Transition to overview generation
+            sm.transition_to(OnboardingState.GENERATING_OVERVIEW)
             self._update_job(job)
 
         except Exception as e:
             raise OnboardingError(f"Parsing/Indexing error: {str(e)}")
+
+    async def _handle_generating_overview(self, job: OnboardingJob, sm: OnboardingStateMachine) -> None:
+        """
+        Handle the overview generation state.
+        Uses hybrid approach: file analysis + RAG queries.
+        """
+        sm.start_state(OnboardingState.GENERATING_OVERVIEW)
+        self._update_job(job)
+
+        try:
+            loop = asyncio.get_event_loop()
+
+            # Phase 1: File Analysis (already collected during parsing)
+            file_data = await loop.run_in_executor(
+                None,
+                self._analyze_collected_files,
+                job
+            )
+
+            # Phase 2: RAG Queries
+            rag_data = await loop.run_in_executor(
+                None,
+                self._query_rag_for_insights,
+                job.collection_name,
+                file_data
+            )
+
+            # Phase 3: LLM Synthesis
+            overview = await loop.run_in_executor(
+                None,
+                self._synthesize_overview,
+                file_data,
+                rag_data,
+                job
+            )
+
+            job.project_overview = overview
+
+            sm.complete_state(OnboardingState.GENERATING_OVERVIEW, {
+                "overview_length": len(overview),
+                "file_data_keys": list(file_data.keys()),
+                "rag_queries_made": len(rag_data)
+            })
+
+            # Transition to completed
+            sm.transition_to(OnboardingState.COMPLETED)
+            self._update_job(job)
+
+        except Exception as e:
+            raise OnboardingError(f"Overview generation error: {str(e)}")
+
+    def _analyze_collected_files(self, job: OnboardingJob) -> Dict[str, any]:
+        """
+        Analyze files collected during parsing.
+
+        Returns:
+            Dictionary with extracted information
+        """
+        file_data = {
+            "readme_content": None,
+            "dependencies": [],
+            "tech_stack": set(job.languages_detected),
+            "config_files": [],
+            "has_docker": False,
+            "package_info": {}
+        }
+
+        for file_path, content in job.metadata_for_overview.items():
+            filename_lower = Path(file_path).name.lower()
+
+            # Extract README
+            if filename_lower.startswith('readme'):
+                file_data["readme_content"] = content[:5000]  # Limit to first 5000 chars
+
+            # Extract dependencies from requirements.txt
+            elif filename_lower == 'requirements.txt':
+                deps = [line.strip().split('==')[0].split('>=')[0].split('<=')[0]
+                       for line in content.split('\n')
+                       if line.strip() and not line.strip().startswith('#')]
+                file_data["dependencies"].extend(deps[:20])  # Limit to 20
+
+            # Extract from package.json
+            elif filename_lower == 'package.json':
+                try:
+                    import json
+                    pkg = json.loads(content)
+                    file_data["package_info"] = {
+                        "name": pkg.get("name"),
+                        "description": pkg.get("description"),
+                        "scripts": list(pkg.get("scripts", {}).keys())
+                    }
+                    if "dependencies" in pkg:
+                        file_data["dependencies"].extend(list(pkg["dependencies"].keys())[:20])
+                except:
+                    pass
+
+            # Detect frameworks from package files
+            elif filename_lower in ['cargo.toml', 'go.mod', 'pom.xml']:
+                file_data["config_files"].append(file_path)
+
+            # Docker detection
+            elif filename_lower == 'dockerfile':
+                file_data["has_docker"] = True
+
+        file_data["tech_stack"] = list(file_data["tech_stack"])
+        return file_data
+
+    def _query_rag_for_insights(self, collection_name: str, file_data: Optional[Dict] = None) -> Dict[str, str]:
+        """
+        Query RAG engine for architectural insights.
+
+        Args:
+            collection_name: Collection to query
+            file_data: Data from file analysis
+
+        Returns:
+            Dictionary with RAG query results
+        """
+        rag_data = {}
+
+        queries = [
+            ("entry_points", "What are the main entry points of this application? List main files, API endpoints, or CLI commands."),
+            ("key_modules", "What are the key modules and components in this codebase? Describe their purpose."),
+            ("architecture", "Describe the overall architecture of this project. What patterns are used?")
+        ]
+
+        for key, query in queries:
+            try:
+                results = self.rag_engine.search_code(
+                    collection_name=collection_name,
+                    query=query,
+                    top_k=5
+                )
+
+                # Format results
+                if results:
+                    formatted = "\n".join([
+                        f"- {r.chunk.file_path}:{r.chunk.start_line} ({r.chunk.chunk_type})"
+                        for r in results[:3]
+                    ])
+                    rag_data[key] = formatted
+                else:
+                    rag_data[key] = "Нет данных"
+            except Exception as e:
+                rag_data[key] = f"Ошибка: {str(e)}"
+
+        return rag_data
+
+    def _synthesize_overview(self, file_data: Dict, rag_data: Dict, job: OnboardingJob) -> str:
+        """
+        Synthesize final overview using LLM.
+
+        Args:
+            file_data: Extracted file data
+            rag_data: RAG query results
+            job: Current job
+
+        Returns:
+            Generated overview in Russian
+        """
+        # Build context for LLM
+        context = f"""
+Проанализируй следующую информацию о репозитории и создай структурированный обзор.
+
+ИНФОРМАЦИЯ ИЗ ФАЙЛОВ:
+README: {file_data.get('readme_content', 'Не найден')[:1000]}
+Зависимости: {', '.join(file_data.get('dependencies', [])[:15])}
+Языки программирования: {', '.join(file_data.get('tech_stack', []))}
+Имя проекта: {file_data.get('package_info', {}).get('name', 'Неизвестно')}
+Описание из package.json: {file_data.get('package_info', {}).get('description', 'Нет')}
+Docker: {'Да' if file_data.get('has_docker') else 'Нет'}
+Количество файлов: {job.total_files}
+Количество чанков кода: {job.total_chunks}
+
+ИНФОРМАЦИЯ ИЗ АНАЛИЗА КОДА (RAG):
+Точки входа:
+{rag_data.get('entry_points', 'Не найдены')}
+
+Ключевые модули:
+{rag_data.get('key_modules', 'Не найдены')}
+
+Архитектура:
+{rag_data.get('architecture', 'Не определена')}
+"""
+
+        prompt = f"""На основе предоставленной информации создай структурированный обзор проекта на русском языке.
+
+{context}
+
+Создай обзор в следующем формате:
+
+## Назначение проекта
+[Опиши назначение проекта на основе README и структуры]
+
+## Основной технологический стек
+[Перечисли основные технологии, фреймворки и языки]
+
+## Ключевые модули/компоненты
+[Опиши основные модули и их назначение]
+
+## Точки входа (entry points)
+[Укажи главные точки входа в приложение]
+
+## Краткая архитектурная схема
+[Текстовое описание архитектуры проекта]
+
+Требования:
+- Пиши кратко и по делу
+- Используй русский язык
+- Основывайся только на предоставленной информации
+- Если какой-то информации нет, так и напиши"""
+        print(prompt)
+        try:
+            return self.llm_router.generate(
+                prompt=prompt,
+                max_tokens=2048,
+                temperature=0.3
+            )
+        except Exception as e:
+            return f"Ошибка генерации обзора: {str(e)}"
+
+    def _is_overview_file(self, file_path: Path, repo_path: Path) -> bool:
+        """
+        Check if a file should be collected for overview generation.
+
+        Args:
+            file_path: Path to the file
+            repo_path: Repository root path
+
+        Returns:
+            True if file should be collected
+        """
+        # Only collect files in root or first-level directories
+        try:
+            relative_path = file_path.relative_to(repo_path)
+            depth = len(relative_path.parts)
+            if depth > 2:  # Skip files too deep in the tree
+                return False
+        except ValueError:
+            return False
+
+        filename_lower = file_path.name.lower()
+
+        # Check if it's a special file
+        if filename_lower in OVERVIEW_FILES:
+            # Skip if file is too large (> 500KB)
+            try:
+                if file_path.stat().st_size > 500_000:
+                    return False
+                return True
+            except:
+                return False
+
+        return False
 
     def _handle_error(self, job: OnboardingJob, sm: OnboardingStateMachine, error: Exception) -> None:
         """

@@ -25,7 +25,6 @@ def generate_chunk_id(repo_url: str, file_path: str, start_line: int) -> str:
         Unique chunk ID
     """
     content = f"{repo_url}:{file_path}:{start_line}"
-    print(content)
     return hashlib.md5(content.encode()).hexdigest()
 
 

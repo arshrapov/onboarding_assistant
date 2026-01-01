@@ -20,14 +20,20 @@ ALLOWED_TRANSITIONS: Dict[OnboardingState, List[OnboardingState]] = {
         OnboardingState.CLONING  # Allow retry
     ],
     OnboardingState.PARSING: [
-        OnboardingState.COMPLETED,
+        OnboardingState.GENERATING_OVERVIEW,
         OnboardingState.FAILED,
         OnboardingState.PARSING  # Allow retry
+    ],
+    OnboardingState.GENERATING_OVERVIEW: [
+        OnboardingState.COMPLETED,
+        OnboardingState.FAILED,
+        OnboardingState.GENERATING_OVERVIEW  # Allow retry
     ],
     OnboardingState.FAILED: [
         # Can retry from failed state back to any state
         OnboardingState.CLONING,
-        OnboardingState.PARSING
+        OnboardingState.PARSING,
+        OnboardingState.GENERATING_OVERVIEW
     ],
     OnboardingState.COMPLETED: [
         # Terminal state - no transitions allowed

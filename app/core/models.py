@@ -67,6 +67,7 @@ class OnboardingState(str, Enum):
     CREATED = "created"
     CLONING = "cloning"
     PARSING = "parsing"
+    GENERATING_OVERVIEW = "generating_overview"
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -145,6 +146,10 @@ class OnboardingJob(BaseModel):
     languages_detected: List[str] = Field(default_factory=list)
     failed_files: List[str] = Field(default_factory=list)
 
+    # Overview generation
+    metadata_for_overview: Dict[str, str] = Field(default_factory=dict, description="File contents collected during parsing for overview generation")
+    project_overview: Optional[str] = Field(None, description="Generated project overview")
+
     # Timestamps
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
@@ -185,6 +190,8 @@ class OnboardingJob(BaseModel):
             "total_chunks": self.total_chunks,
             "languages_detected": self.languages_detected,
             "failed_files": self.failed_files,
+            "metadata_for_overview": self.metadata_for_overview,
+            "project_overview": self.project_overview,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
@@ -221,6 +228,8 @@ class OnboardingJob(BaseModel):
             total_chunks=data.get("total_chunks", 0),
             languages_detected=data.get("languages_detected", []),
             failed_files=data.get("failed_files", []),
+            metadata_for_overview=data.get("metadata_for_overview", {}),
+            project_overview=data.get("project_overview"),
             created_at=datetime.fromisoformat(data["created_at"]),
             updated_at=datetime.fromisoformat(data["updated_at"]),
             completed_at=datetime.fromisoformat(data["completed_at"]) if data.get("completed_at") else None,
@@ -233,6 +242,7 @@ class OnboardingJob(BaseModel):
             OnboardingState.CREATED: 0,
             OnboardingState.CLONING: 10,
             OnboardingState.PARSING: 20,
+            OnboardingState.GENERATING_OVERVIEW: 90,
             OnboardingState.COMPLETED: 100,
             OnboardingState.FAILED: 0
         }
@@ -245,7 +255,7 @@ class OnboardingJob(BaseModel):
             if metrics and metrics.data.get("processed_files"):
                 processed = metrics.data["processed_files"]
                 file_progress = processed / self.total_files
-                base += file_progress * 80  # 80% allocated to parsing/indexing
+                base += file_progress * 70  # 70% allocated to parsing/indexing
 
         return min(int(base), 100)
 

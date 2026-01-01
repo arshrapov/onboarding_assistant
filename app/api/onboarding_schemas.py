@@ -79,6 +79,9 @@ class OnboardingStatusResponse(BaseModel):
     # Error tracking
     error: Optional[str] = Field(None, description="Error message if job failed")
 
+    # Project overview
+    project_overview: Optional[str] = Field(None, description="AI-generated project overview (available after completion)")
+
     # Timestamps
     created_at: datetime = Field(..., description="Job creation timestamp")
     updated_at: datetime = Field(..., description="Last update timestamp")
@@ -107,6 +110,7 @@ class OnboardingStatusResponse(BaseModel):
                 "retry_count": 0,
                 "max_retries": 3,
                 "error": None,
+                "project_overview": None,
                 "created_at": "2026-01-01T12:00:00Z",
                 "updated_at": "2026-01-01T12:05:30Z",
                 "completed_at": None,
