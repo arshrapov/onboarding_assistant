@@ -9,15 +9,11 @@ from pathlib import Path
 from typing import Dict, Optional, List
 from datetime import datetime
 
-from app.core.models import OnboardingJob, OnboardingState, CodeChunk
+from app.core.models import OnboardingJob, OnboardingState
 from app.core.exceptions import OnboardingError, StateTransitionError
 from app.services.state_machine import OnboardingStateMachine
-from app.services.repo_downloader import RepositoryDownloader
-from app.services.rag_engine import RAGEngine
-from app.services.llm_router import LLMRouter
-from app.services.vector_store import create_collection_name
+from app.services.rag_engine import RAGEngine, create_collection_name
 from app.utils.file_filter import filter_repository_files, count_files_by_language
-from app.utils.file_parser import parse_file
 from app.config import settings
 
 
@@ -45,9 +41,7 @@ class RepositoryOnboardingService:
         """Initialize the onboarding service."""
         self.jobs: Dict[str, OnboardingJob] = {}
         self.jobs_file = Path(settings.cache_dir) / "onboarding_jobs.json"
-        self.downloader = RepositoryDownloader()
-        self.rag_engine = RAGEngine()
-        self.llm_router = LLMRouter()
+        self.rag_engine = RAGEngine()  # Now handles everything: repo loading, indexing, LLM
 
         self._ensure_cache_dir()
         self._load_jobs()
@@ -166,22 +160,28 @@ class RepositoryOnboardingService:
             self._handle_error(job, state_machine, e)
 
     async def _handle_cloning(self, job: OnboardingJob, sm: OnboardingStateMachine) -> None:
-        """Handle the cloning state."""
+        """Handle the cloning/loading state using RAG engine."""
         sm.start_state(OnboardingState.CLONING)
         self._update_job(job)
 
         try:
-            # Clone repository (run in executor to avoid blocking)
+            # Load repository using RAG engine (run in executor to avoid blocking)
             loop = asyncio.get_event_loop()
-            clone_path = await loop.run_in_executor(
+            clone_path, documents = await loop.run_in_executor(
                 None,
-                self.downloader.clone_repository,
-                job.repo_url
+                self.rag_engine.load_repository,
+                job.repo_url,
+                False,  # force parameter
+                settings.github_token  # GitHub token from config
             )
             job.clone_path = clone_path
 
+            # Store documents for later use in parsing
+            job.llama_documents = documents
+
             sm.complete_state(OnboardingState.CLONING, {
-                "clone_path": clone_path
+                "clone_path": clone_path,
+                "documents_loaded": len(documents)
             })
 
             # Transition to parsing
@@ -193,111 +193,224 @@ class RepositoryOnboardingService:
 
     async def _handle_parsing(self, job: OnboardingJob, sm: OnboardingStateMachine) -> None:
         """
-        Handle the parsing state - filter files, parse, and stream chunks to vector store.
+        Handle the parsing state - process LlamaIndex documents and stream chunks to vector store.
         This state now includes all indexing operations.
         """
         sm.start_state(OnboardingState.PARSING)
         self._update_job(job)
 
         try:
-            repo_path = Path(job.clone_path)
+            # Use LlamaIndex documents if available
+            if job.llama_documents:
+                await self._handle_parsing_from_llama_documents(job, sm)
+            else:
+                # Fallback to file-based parsing for backward compatibility
+                await self._handle_parsing_from_files(job, sm)
 
-            # Filter files (only done once!)
-            loop = asyncio.get_event_loop()
-            files = await loop.run_in_executor(
+        except Exception as e:
+            raise OnboardingError(f"Parsing/Indexing error: {str(e)}")
+
+    async def _handle_parsing_from_llama_documents(self, job: OnboardingJob, sm: OnboardingStateMachine) -> None:
+        """
+        Parse using LlamaIndex documents.
+        Add documents directly to the vector store without conversion.
+        """
+        from pathlib import Path
+
+        loop = asyncio.get_event_loop()
+
+        # Get document count and languages
+        job.total_files = len(job.llama_documents)
+        language_counts = {}
+
+        # Create index if it doesn't exist
+        if not self.rag_engine.index_exists(job.collection_name):
+            self.rag_engine.create_index(job.repo_url, job.collection_name)
+
+        # Process documents and add to vector store
+        processed_files = 0
+        total_docs = 0
+        doc_batch = []
+        BATCH_SIZE = 50  # Process documents in batches
+
+        for doc in job.llama_documents:
+            try:
+                file_path = doc.metadata.get('file_path', 'unknown')
+                file_name = doc.metadata.get('file_name', 'unknown')
+
+                # Detect language from file extension
+                file_ext = Path(file_path).suffix.lower()
+                language = self._get_language_from_extension(file_ext)
+                if language:
+                    language_counts[language] = language_counts.get(language, 0) + 1
+
+                # Collect metadata for overview generation
+                if self._is_overview_file_name(file_name):
+                    try:
+                        job.metadata_for_overview[file_path] = doc.text[:500000]  # Limit size
+                    except Exception:
+                        pass
+
+                # Add document to batch
+                doc_batch.append(doc)
+                total_docs += 1
+                processed_files += 1
+
+                # When batch is full, add to vector store
+                if len(doc_batch) >= BATCH_SIZE:
+                    await loop.run_in_executor(
+                        None,
+                        self.rag_engine.add_documents,
+                        job.collection_name,
+                        doc_batch
+                    )
+                    doc_batch = []  # Clear batch
+
+                # Update progress periodically
+                if processed_files % 10 == 0:
+                    metrics = sm.get_state_metrics(OnboardingState.PARSING)
+                    metrics.data["processed_files"] = processed_files
+                    metrics.data["documents_indexed"] = total_docs
+                    self._update_job(job)
+
+            except Exception as e:
+                # Skip failed files, log them
+                job.failed_files.append(file_path)
+                print(f"Error processing {file_path}: {e}")
+
+        # Add remaining documents in batch
+        if doc_batch:
+            await loop.run_in_executor(
                 None,
-                filter_repository_files,
-                repo_path
+                self.rag_engine.add_documents,
+                job.collection_name,
+                doc_batch
             )
 
-            job.total_files = len(files)
-            language_counts = count_files_by_language(files)
-            job.languages_detected = list(language_counts.keys())
-            self._update_job(job)
+        job.total_chunks = total_docs
+        job.languages_detected = list(language_counts.keys())
 
-            # Create index if it doesn't exist
-            if not self.rag_engine.index_exists(job.collection_name):
-                self.rag_engine.create_index(job.repo_url, job.collection_name)
+        sm.complete_state(OnboardingState.PARSING, {
+            "processed_files": processed_files,
+            "documents_indexed": total_docs,
+            "failed_files": len(job.failed_files),
+            "languages": language_counts,
+            "overview_files_collected": len(job.metadata_for_overview)
+        })
 
-            # Parse files and stream chunks directly to vector store
-            processed_files = 0
-            total_chunks = 0
-            chunk_batch: List[CodeChunk] = []
-            BATCH_SIZE = 50  # Process chunks in batches
+        # Transition to overview generation
+        sm.transition_to(OnboardingState.GENERATING_OVERVIEW)
+        self._update_job(job)
 
-            for file_path in files:
+    async def _handle_parsing_from_files(self, job: OnboardingJob, sm: OnboardingStateMachine) -> None:
+        """
+        Parse using file system (fallback/backward compatibility).
+        Note: This path is rarely used since LlamaIndex documents are preferred.
+        """
+        from llama_index.core import Document
+
+        repo_path = Path(job.clone_path)
+
+        # Filter files (only done once!)
+        loop = asyncio.get_event_loop()
+        files = await loop.run_in_executor(
+            None,
+            filter_repository_files,
+            repo_path
+        )
+
+        job.total_files = len(files)
+        language_counts = count_files_by_language(files)
+        job.languages_detected = list(language_counts.keys())
+        self._update_job(job)
+
+        # Create index if it doesn't exist
+        if not self.rag_engine.index_exists(job.collection_name):
+            self.rag_engine.create_index(job.repo_url, job.collection_name)
+
+        # Convert files to documents and add to vector store
+        processed_files = 0
+        total_docs = 0
+        doc_batch = []
+        BATCH_SIZE = 50  # Process documents in batches
+
+        for file_path in files:
+            try:
+                # Collect metadata for overview generation
+                if self._is_overview_file(file_path, repo_path):
+                    try:
+                        content = file_path.read_text(encoding='utf-8', errors='ignore')
+                        relative_path = str(file_path.relative_to(repo_path))
+                        job.metadata_for_overview[relative_path] = content
+                    except Exception:
+                        pass
+
+                # Read file and create Document
                 try:
-                    # Collect metadata for overview generation (passive collection)
-                    if self._is_overview_file(file_path, repo_path):
-                        try:
-                            content = file_path.read_text(encoding='utf-8', errors='ignore')
-                            relative_path = str(file_path.relative_to(repo_path))
-                            job.metadata_for_overview[relative_path] = content
-                        except Exception as e:
-                            # Silently skip files that can't be read
-                            pass
+                    content = file_path.read_text(encoding='utf-8', errors='ignore')
+                    relative_path = str(file_path.relative_to(repo_path))
 
-                    # Parse file
-                    chunks = await loop.run_in_executor(
-                        None,
-                        parse_file,
-                        file_path,
-                        repo_path,
-                        job.repo_url
+                    # Create LlamaIndex Document
+                    doc = Document(
+                        text=content,
+                        metadata={
+                            "file_path": relative_path,
+                            "file_name": file_path.name,
+                            "language": self._get_language_from_extension(file_path.suffix.lower())
+                        }
                     )
 
-
-                    chunk_batch.extend(chunks)
-                    total_chunks += len(chunks)
+                    doc_batch.append(doc)
+                    total_docs += 1
                     processed_files += 1
 
                     # When batch is full, add to vector store
-                    if len(chunk_batch) >= BATCH_SIZE:
+                    if len(doc_batch) >= BATCH_SIZE:
                         await loop.run_in_executor(
                             None,
-                            self.rag_engine.add_chunks,
+                            self.rag_engine.add_documents,
                             job.collection_name,
-                            chunk_batch
+                            doc_batch
                         )
-                        chunk_batch = []  # Clear batch
+                        doc_batch = []  # Clear batch
 
                     # Update progress periodically
                     if processed_files % 10 == 0:
                         metrics = sm.get_state_metrics(OnboardingState.PARSING)
                         metrics.data["processed_files"] = processed_files
-                        metrics.data["chunks_created"] = total_chunks
+                        metrics.data["documents_indexed"] = total_docs
                         self._update_job(job)
 
                 except Exception as e:
-                    # Skip failed files, log them
+                    print(f"Error reading file {file_path}: {e}")
                     job.failed_files.append(str(file_path))
 
-            # Add remaining chunks in batch
-            if chunk_batch:
-                await loop.run_in_executor(
-                    None,
-                    self.rag_engine.add_chunks,
-                    job.collection_name,
-                    chunk_batch
-                )
+            except Exception as e:
+                # Skip failed files, log them
+                job.failed_files.append(str(file_path))
 
-            job.total_chunks = total_chunks
+        # Add remaining documents in batch
+        if doc_batch:
+            await loop.run_in_executor(
+                None,
+                self.rag_engine.add_documents,
+                job.collection_name,
+                doc_batch
+            )
 
-            sm.complete_state(OnboardingState.PARSING, {
-                "processed_files": processed_files,
-                "chunks_created": total_chunks,
-                "chunks_indexed": total_chunks,
-                "failed_files": len(job.failed_files),
-                "languages": language_counts,
-                "overview_files_collected": len(job.metadata_for_overview)
-            })
+        job.total_chunks = total_docs
 
-            # Transition to overview generation
-            sm.transition_to(OnboardingState.GENERATING_OVERVIEW)
-            self._update_job(job)
+        sm.complete_state(OnboardingState.PARSING, {
+            "processed_files": processed_files,
+            "documents_indexed": total_docs,
+            "failed_files": len(job.failed_files),
+            "languages": language_counts,
+            "overview_files_collected": len(job.metadata_for_overview)
+        })
 
-        except Exception as e:
-            raise OnboardingError(f"Parsing/Indexing error: {str(e)}")
+        # Transition to overview generation
+        sm.transition_to(OnboardingState.GENERATING_OVERVIEW)
+        self._update_job(job)
 
     async def _handle_generating_overview(self, job: OnboardingJob, sm: OnboardingStateMachine) -> None:
         """
@@ -426,17 +539,17 @@ class RepositoryOnboardingService:
 
         for key, query in queries:
             try:
-                results = self.rag_engine.search_code(
+                results = self.rag_engine.search(
                     collection_name=collection_name,
                     query=query,
                     top_k=5
                 )
 
-                # Format results
+                # Format results from LlamaIndex NodeWithScore objects
                 if results:
                     formatted = "\n".join([
-                        f"- {r.chunk.file_path}:{r.chunk.start_line} ({r.chunk.chunk_type})"
-                        for r in results[:3]
+                        f"- {node.metadata.get('file_path', 'unknown')} ({node.metadata.get('language', 'unknown')})"
+                        for node in results[:3]
                     ])
                     rag_data[key] = formatted
                 else:
@@ -511,11 +624,10 @@ Docker: {'Да' if file_data.get('has_docker') else 'Нет'}
 - Если какой-то информации нет, так и напиши"""
         print(prompt)
         try:
-            return self.llm_router.generate(
-                prompt=prompt,
-                max_tokens=2048,
-                temperature=0.3
-            )
+            # Use RAG engine's LLM (configured in Settings.llm)
+            from llama_index.core import Settings
+            response = Settings.llm.complete(prompt)
+            return str(response)
         except Exception as e:
             return f"Ошибка генерации обзора: {str(e)}"
 
@@ -552,6 +664,52 @@ Docker: {'Да' if file_data.get('has_docker') else 'Нет'}
                 return False
 
         return False
+
+    def _is_overview_file_name(self, file_name: str) -> bool:
+        """
+        Check if a file name indicates it should be collected for overview.
+
+        Args:
+            file_name: Name of the file
+
+        Returns:
+            True if file should be collected
+        """
+        filename_lower = file_name.lower()
+        return filename_lower in OVERVIEW_FILES
+
+    def _get_language_from_extension(self, extension: str) -> Optional[str]:
+        """
+        Get language name from file extension.
+
+        Args:
+            extension: File extension (e.g., '.py', '.js')
+
+        Returns:
+            Language name or None
+        """
+        extension_map = {
+            '.py': 'Python',
+            '.js': 'JavaScript',
+            '.ts': 'TypeScript',
+            '.tsx': 'TypeScript',
+            '.jsx': 'JavaScript',
+            '.java': 'Java',
+            '.go': 'Go',
+            '.rs': 'Rust',
+            '.cpp': 'C++',
+            '.c': 'C',
+            '.h': 'C/C++',
+            '.cs': 'C#',
+            '.rb': 'Ruby',
+            '.php': 'PHP',
+            '.md': 'Markdown',
+            '.txt': 'Text',
+            '.json': 'JSON',
+            '.yaml': 'YAML',
+            '.yml': 'YAML',
+        }
+        return extension_map.get(extension.lower())
 
     def _handle_error(self, job: OnboardingJob, sm: OnboardingStateMachine, error: Exception) -> None:
         """

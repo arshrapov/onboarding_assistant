@@ -4,7 +4,7 @@ Uses pydantic-settings for environment variable management.
 """
 
 from pydantic_settings import BaseSettings
-from typing import List
+from typing import List, Optional
 
 
 class Settings(BaseSettings):
@@ -29,7 +29,10 @@ class Settings(BaseSettings):
 
     # Server settings for Gradio
     server_port: int = 7860
+    # Server settings
+    server_port: int = 7860  # FastAPI backend port
     server_host: str = "0.0.0.0"
+
 
     # RAG settings
     chunk_size: int = 1000
@@ -38,7 +41,10 @@ class Settings(BaseSettings):
 
     # Required: Gemini API key
     gemini_api_key: str
-    
+
+    # Optional: GitHub Personal Access Token (for private repos or higher rate limits)
+    github_token: Optional[str] = None
+
     # LLM settings
     gemini_model: str = "gemini-1.5-flash"
     max_tokens: int = 8192

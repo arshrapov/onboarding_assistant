@@ -1,137 +1,390 @@
 """
-RAG (Retrieval-Augmented Generation) Engine for code question answering.
+RAG (Retrieval-Augmented Generation) Engine using LlamaIndex.
+Handles repository loading, indexing, retrieval, and generation.
 """
 
 from typing import List, Optional, Dict, Any
-from chromadb.api.types import EmbeddingFunction
-import google.generativeai as genai
+from pathlib import Path
+import shutil
+import pickle
+import hashlib
 
-from app.core.models import VectorStore, CodeChunk, SearchResult
-from app.services.vector_store import ChromaDBStore, create_collection_name
-from app.services.embedding_factory import create_embedding_function
+from llama_index.core import (
+    VectorStoreIndex,
+    Document,
+    Settings,
+    StorageContext,
+    load_index_from_storage
+)
+from llama_index.vector_stores.chroma import ChromaVectorStore
+from llama_index.embeddings.gemini import GeminiEmbedding
+from llama_index.llms.gemini import Gemini
+from llama_index.readers.github import GithubRepositoryReader, GithubClient
+import chromadb
+
+# CodeChunk and SearchResult removed - working directly with LlamaIndex Documents
+from app.utils.github_utils import parse_github_url, get_repo_identifier, normalize_github_url
+from app.core.exceptions import RepositoryDownloadError
 from app.config import settings
+
+
+def create_collection_name(repo_url: str) -> str:
+    """
+    Create a unique collection name from repository URL.
+
+    Args:
+        repo_url: Git repository URL
+
+    Returns:
+        Sanitized collection name for ChromaDB
+    """
+    # Create hash of URL for uniqueness
+    url_hash = hashlib.md5(repo_url.encode()).hexdigest()[:8]
+
+    # Extract repo name from URL
+    repo_name = repo_url.rstrip("/").split("/")[-1]
+    repo_name = repo_name.replace(".git", "")
+
+    # Sanitize: ChromaDB collection names have restrictions
+    repo_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in repo_name)
+
+    # Combine with hash for uniqueness and add prefix
+    collection_name = f"{settings.chroma_collection_prefix}{repo_name}_{url_hash}"
+
+    return collection_name.lower()  # ChromaDB requires lowercase
 
 
 class RAGEngine:
     """
-    Orchestrates the RAG workflow:
-    1. Indexing: Store code chunks with embeddings
-    2. Retrieval: Find relevant code for queries
-    3. Generation: Answer questions using retrieved context
+    LlamaIndex-based RAG Engine that handles:
+    1. Repository downloading from GitHub
+    2. Document indexing with vector embeddings
+    3. Semantic search
+    4. Question answering with LLM
     """
 
-    def __init__(
-        self,
-        vector_store: Optional[VectorStore] = None,
-        embedding_function: Optional[EmbeddingFunction] = None
-    ):
-        """
-        Initialize RAG engine.
-
-        Args:
-            vector_store: Vector store implementation (defaults to ChromaDBStore)
-            embedding_function: ChromaDB embedding function (defaults to factory-created based on settings)
-        """
-        # Create embedding function first
-        self.embedding_function = embedding_function or create_embedding_function()
-
-        # Initialize vector store with embedding function
-        self.vector_store = vector_store or ChromaDBStore(
-            embedding_function=self.embedding_function
+    def __init__(self):
+        """Initialize RAG engine with LlamaIndex components."""
+        # Configure LlamaIndex global settings
+        Settings.llm = Gemini(
+            api_key=settings.gemini_api_key,
+            model_name=settings.gemini_model,
+            temperature=settings.temperature,
+            max_tokens=settings.max_tokens
+        )
+        Settings.embed_model = GeminiEmbedding(
+            api_key=settings.gemini_api_key,
+            model_name=settings.embedding_model
         )
 
-        # Configure Gemini API for LLM generation
-        genai.configure(api_key=settings.gemini_api_key)
-        self.llm_model = genai.GenerativeModel(settings.gemini_model)
+        # Initialize ChromaDB client
+        self.chroma_client = chromadb.PersistentClient(
+            path=settings.indexes_dir
+        )
 
-    def create_index(self, repo_url: str, repo_name: str) -> str:
+        # Store loaded indexes in memory
+        self.indexes: Dict[str, VectorStoreIndex] = {}
+
+        # Ensure directories exist
+        self._ensure_dirs()
+
+    def _ensure_dirs(self) -> None:
+        """Ensure required directories exist."""
+        Path(settings.repos_dir).mkdir(parents=True, exist_ok=True)
+        Path(settings.indexes_dir).mkdir(parents=True, exist_ok=True)
+        Path(settings.cache_dir).mkdir(parents=True, exist_ok=True)
+
+    # ==================== Repository Loading ====================
+
+    def load_repository(
+        self,
+        repo_url: str,
+        force: bool = False,
+        github_token: Optional[str] = None
+    ) -> tuple[str, List[Document]]:
         """
-        Create a new vector index for a repository.
+        Load a GitHub repository using LlamaIndex GithubRepositoryReader.
+
+        Args:
+            repo_url: GitHub repository URL
+            force: If True, remove existing data and re-download
+            github_token: Optional GitHub personal access token
+
+        Returns:
+            Tuple of (local_path, documents)
+
+        Raises:
+            RepositoryDownloadError: If loading fails
+        """
+        # Normalize URL
+        try:
+            normalized_url = normalize_github_url(repo_url)
+        except Exception as e:
+            raise RepositoryDownloadError(f"Invalid repository URL: {str(e)}")
+
+        # Get storage path
+        repo_identifier = get_repo_identifier(normalized_url)
+        repo_path = Path(settings.repos_dir) / repo_identifier
+
+        try:
+            # Check if repository already exists
+            if repo_path.exists():
+                if force:
+                    shutil.rmtree(repo_path)
+                else:
+                    # Try to load existing documents
+                    documents = self._load_documents_from_disk(repo_path)
+                    if documents:
+                        return str(repo_path), documents
+                    # If no documents found, re-download
+                    shutil.rmtree(repo_path)
+
+            # Parse GitHub URL
+            owner, repo_name = parse_github_url(normalized_url)
+
+            # Initialize GitHub client
+            github_client = GithubClient(
+                github_token=github_token or settings.github_token
+            )
+
+            # Create GithubRepositoryReader
+            reader = GithubRepositoryReader(
+                github_client=github_client,
+                owner=owner,
+                repo=repo_name,
+                use_parser=False,  # Get raw content
+                verbose=True,
+                filter_directories=(
+                    ["node_modules", ".git", "__pycache__", "venv", ".venv",
+                     "dist", "build", ".idea", ".vscode", "coverage"],
+                    GithubRepositoryReader.FilterType.EXCLUDE
+                ),
+                filter_file_extensions=(
+                    [ext for ext in settings.supported_extensions],
+                    GithubRepositoryReader.FilterType.INCLUDE
+                )
+            )
+
+            # Load documents from GitHub
+            print(f"Loading repository {owner}/{repo_name} from GitHub...")
+            try:
+                documents = reader.load_data(branch="main")
+            except Exception as branch_error:
+                print(f"Failed to load from 'main' branch: {branch_error}")
+                print("Trying 'master' branch...")
+                try:
+                    documents = reader.load_data(branch="master")
+                except Exception as master_error:
+                    raise RepositoryDownloadError(
+                        f"Failed to load from both 'main' and 'master' branches. "
+                        f"Main error: {branch_error}. Master error: {master_error}"
+                    )
+
+            if not documents:
+                raise RepositoryDownloadError(
+                    f"No documents loaded from repository {owner}/{repo_name}"
+                )
+
+            # Save documents to disk
+            self._save_documents_to_disk(documents, repo_path)
+
+            print(f"Successfully loaded {len(documents)} documents from {owner}/{repo_name}")
+
+            return str(repo_path), documents
+
+        except RepositoryDownloadError:
+            raise
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            print(f"Full error traceback:\n{error_details}")
+            raise RepositoryDownloadError(f"Failed to load repository: {str(e)}")
+
+    def _save_documents_to_disk(self, documents: List[Document], save_path: Path) -> None:
+        """Save documents to disk."""
+        save_path.mkdir(parents=True, exist_ok=True)
+
+        documents_file = save_path / "documents.pkl"
+        with open(documents_file, 'wb') as f:
+            pickle.dump(documents, f)
+
+        # Save metadata
+        metadata_file = save_path / "metadata.txt"
+        with open(metadata_file, 'w', encoding='utf-8') as f:
+            f.write(f"Total documents: {len(documents)}\n")
+            f.write("=" * 80 + "\n\n")
+            for i, doc in enumerate(documents):
+                f.write(f"Document {i + 1}:\n")
+                f.write(f"  File: {doc.metadata.get('file_path', 'Unknown')}\n")
+                f.write(f"  Size: {len(doc.text)} characters\n")
+                f.write("-" * 80 + "\n")
+
+    def _load_documents_from_disk(self, repo_path: Path) -> Optional[List[Document]]:
+        """Load documents from disk."""
+        documents_file = repo_path / "documents.pkl"
+        if not documents_file.exists():
+            return None
+
+        try:
+            with open(documents_file, 'rb') as f:
+                return pickle.load(f)
+        except Exception as e:
+            print(f"Warning: Could not load documents from {documents_file}: {e}")
+            return None
+
+    # ==================== Index Management ====================
+
+    def create_index(
+        self,
+        repo_url: str,
+        collection_name: str,
+        documents: Optional[List[Document]] = None
+    ) -> VectorStoreIndex:
+        """
+        Create a new vector index from documents.
 
         Args:
             repo_url: Repository URL
-            repo_name: Repository name
+            collection_name: ChromaDB collection name
+            documents: Optional documents to index (if None, loads from disk)
 
         Returns:
-            Collection name created
+            Created VectorStoreIndex
         """
-        collection_name = create_collection_name(repo_url)
-        self.vector_store.create_collection(collection_name)
-        return collection_name
+        # Load documents if not provided
+        if documents is None:
+            repo_identifier = get_repo_identifier(repo_url)
+            repo_path = Path(settings.repos_dir) / repo_identifier
+            documents = self._load_documents_from_disk(repo_path)
+            if not documents:
+                raise ValueError(f"No documents found for {repo_url}")
 
-    def delete_index(self, collection_name: str) -> None:
-        """
-        Delete a repository index.
+        # Create ChromaDB collection
+        chroma_collection = self.chroma_client.get_or_create_collection(
+            name=collection_name
+        )
 
-        Args:
-            collection_name: Name of the collection to delete
-        """
-        self.vector_store.delete_collection(collection_name)
+        # Create vector store
+        vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+        storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-    def index_exists(self, collection_name: str) -> bool:
+        # Build index from documents
+        index = VectorStoreIndex.from_documents(
+            documents,
+            storage_context=storage_context,
+            show_progress=True
+        )
+
+        # Cache index
+        self.indexes[collection_name] = index
+
+        return index
+
+    def load_index(self, collection_name: str) -> VectorStoreIndex:
         """
-        Check if an index exists.
+        Load an existing index.
 
         Args:
             collection_name: Collection name
 
         Returns:
-            True if index exists
+            Loaded VectorStoreIndex
         """
-        return self.vector_store.collection_exists(collection_name)
+        # Check cache first
+        if collection_name in self.indexes:
+            return self.indexes[collection_name]
 
-    def add_chunks(
-        self,
-        collection_name: str,
-        chunks: List[CodeChunk]
-    ) -> None:
+        # Load from ChromaDB
+        chroma_collection = self.chroma_client.get_collection(name=collection_name)
+        vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+
+        index = VectorStoreIndex.from_vector_store(vector_store)
+
+        # Cache index
+        self.indexes[collection_name] = index
+
+        return index
+
+    def index_exists(self, collection_name: str) -> bool:
+        """Check if index exists."""
+        try:
+            self.chroma_client.get_collection(name=collection_name)
+            return True
+        except:
+            return False
+
+    def delete_index(self, collection_name: str) -> None:
+        """Delete an index."""
+        try:
+            self.chroma_client.delete_collection(name=collection_name)
+            if collection_name in self.indexes:
+                del self.indexes[collection_name]
+        except Exception as e:
+            print(f"Warning: Could not delete collection {collection_name}: {e}")
+
+    # ==================== Document Management ====================
+
+    def add_documents(self, collection_name: str, documents: List[Document]) -> None:
         """
-        Add code chunks to the index. Embeddings are generated automatically
-        by the vector store's embedding function.
+        Add documents to an existing index.
 
         Args:
-            collection_name: Collection to add to
-            chunks: List of code chunks to index
+            collection_name: Collection name
+            documents: List of LlamaIndex Documents to add
         """
-        if not chunks:
+        if not documents:
             return
 
-        # Add to vector store (embeddings generated automatically)
-        self.vector_store.add_documents(
-            collection_name=collection_name,
-            chunks=chunks
-        )
+        # Get or create index
+        if self.index_exists(collection_name):
+            index = self.load_index(collection_name)
+        else:
+            # Create new index
+            chroma_collection = self.chroma_client.get_or_create_collection(
+                name=collection_name
+            )
+            vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+            storage_context = StorageContext.from_defaults(vector_store=vector_store)
+            index = VectorStoreIndex.from_documents(
+                [],
+                storage_context=storage_context
+            )
+            self.indexes[collection_name] = index
 
-    def search_code(
+        # Insert documents into index
+        for doc in documents:
+            index.insert(doc)
+
+    def search(
         self,
         collection_name: str,
         query: str,
-        top_k: Optional[int] = None,
-        filter_metadata: Optional[Dict[str, Any]] = None
-    ) -> List[SearchResult]:
+        top_k: Optional[int] = None
+    ) -> List[Any]:
         """
-        Search for relevant code chunks. Query embedding is generated automatically
-        by the vector store's embedding function.
+        Search for relevant documents using semantic search.
 
         Args:
-            collection_name: Collection to search
-            query: Natural language query
-            top_k: Number of results (defaults to settings.top_k_results)
-            filter_metadata: Optional metadata filters
+            collection_name: Collection name
+            query: Search query
+            top_k: Number of results
 
         Returns:
-            List of search results
+            List of NodeWithScore objects from LlamaIndex
         """
         if top_k is None:
             top_k = settings.top_k_results
 
-        # Search vector store (query embedding generated automatically)
-        return self.vector_store.search(
-            collection_name=collection_name,
-            query_text=query,
-            top_k=top_k,
-            filter_metadata=filter_metadata
-        )
+        # Load index
+        index = self.load_index(collection_name)
+
+        # Query index
+        retriever = index.as_retriever(similarity_top_k=top_k)
+        nodes = retriever.retrieve(query)
+
+        return nodes
+
+    # ==================== Question Answering ====================
 
     def answer_question(
         self,
@@ -140,131 +393,51 @@ class RAGEngine:
         top_k: Optional[int] = None
     ) -> str:
         """
-        Answer a question using RAG.
+        Answer a question using RAG with LlamaIndex.
 
         Args:
-            collection_name: Repository collection to search
+            collection_name: Collection to search
             question: User's question
-            top_k: Number of context chunks to retrieve
+            top_k: Number of context chunks
 
         Returns:
-            Generated answer with code references
+            Generated answer
         """
-        # Retrieve relevant code
-        search_results = self.search_code(
-            collection_name=collection_name,
-            query=question,
-            top_k=top_k
+        if top_k is None:
+            top_k = settings.top_k_results
+
+        # Load index
+        index = self.load_index(collection_name)
+
+        # Create query engine
+        query_engine = index.as_query_engine(
+            similarity_top_k=top_k,
+            response_mode="compact"
         )
 
-        if not search_results:
-            return "I couldn't find relevant code to answer your question. Please try rephrasing or asking about a different topic."
+        # Query
+        response = query_engine.query(question)
 
-        # Build context from search results
-        context = self._build_context(search_results)
+        return str(response)
 
-        # Generate answer
-        prompt = self._build_qa_prompt(question, context, search_results)
-
-        response = self.llm_model.generate_content(
-            prompt,
-            generation_config=genai.GenerationConfig(
-                max_output_tokens=settings.max_tokens,
-                temperature=settings.temperature
-            )
-        )
-
-        return response.text
-
-    def _build_context(self, search_results: List[SearchResult]) -> str:
+    def get_collection_stats(self, collection_name: str) -> Dict[str, Any]:
         """
-        Build context string from search results.
-
-        Args:
-            search_results: List of search results
-
-        Returns:
-            Formatted context string
-        """
-        context_parts = []
-
-        for i, result in enumerate(search_results, 1):
-            chunk = result.chunk
-            context_parts.append(
-                f"--- Code Reference {i} ---\n"
-                f"File: {chunk.file_path}:{chunk.start_line}-{chunk.end_line}\n"
-                f"Type: {chunk.chunk_type}\n"
-                f"Language: {chunk.language or 'unknown'}\n"
-                f"Relevance Score: {result.score:.2f}\n\n"
-                f"```{chunk.language or ''}\n"
-                f"{chunk.content}\n"
-                f"```\n"
-            )
-
-        return "\n".join(context_parts)
-
-    def _build_qa_prompt(
-        self,
-        question: str,
-        context: str,
-        search_results: List[SearchResult]
-    ) -> str:
-        """
-        Build prompt for question answering.
-
-        Args:
-            question: User's question
-            context: Context from search results
-            search_results: Original search results for references
-
-        Returns:
-            Formatted prompt
-        """
-        # Build file references
-        file_refs = []
-        for result in search_results:
-            chunk = result.chunk
-            file_refs.append(
-                f"- {chunk.file_path}:{chunk.start_line}"
-            )
-
-        references_list = "\n".join(file_refs)
-
-        prompt = f"""You are a helpful code assistant analyzing a repository.
-
-Answer the following question based on the provided code context.
-
-QUESTION:
-{question}
-
-CODE CONTEXT:
-{context}
-
-INSTRUCTIONS:
-1. Answer the question accurately based on the code context provided
-2. Include specific file references using the format: file_path:line_number
-3. If the code context doesn't fully answer the question, say so
-4. Be concise but thorough
-5. Use code snippets when helpful
-6. Reference these files when relevant:
-{references_list}
-
-ANSWER:"""
-
-        return prompt
-
-    def get_collection_stats(self, collection_name: str) -> Dict[str, int]:
-        """
-        Get statistics about a collection.
+        Get collection statistics.
 
         Args:
             collection_name: Collection name
 
         Returns:
-            Dictionary with statistics
+            Statistics dictionary
         """
-        count = self.vector_store.get_collection_count(collection_name)
-        return {
-            "total_chunks": count,
-            "collection_name": collection_name
-        }
+        try:
+            collection = self.chroma_client.get_collection(name=collection_name)
+            return {
+                "total_chunks": collection.count(),
+                "collection_name": collection_name
+            }
+        except:
+            return {
+                "total_chunks": 0,
+                "collection_name": collection_name
+            }

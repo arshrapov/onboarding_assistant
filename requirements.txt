@@ -1,12 +1,15 @@
-# Git integration
-gitpython==3.1.40
+# LlamaIndex - Core and integrations
+llama-index-core>=0.10.1,<0.11.0
+llama-index-embeddings-gemini>=0.1.0
+llama-index-llms-gemini>=0.1.0
+llama-index-vector-stores-chroma>=0.1.0
+llama-index-readers-github>=0.1.9
 
 # Vector database
 chromadb==0.4.22
 
-# LLM and embeddings
+# LLM and embeddings (direct dependencies - may be required by LlamaIndex)
 google-generativeai==0.3.2
-sentence-transformers==2.2.2
 
 # Data validation and settings
 pydantic==2.5.3

@@ -140,6 +140,9 @@ class OnboardingJob(BaseModel):
     collection_name: Optional[str] = None
     clone_path: Optional[str] = None
 
+    # LlamaIndex documents (transient - not persisted to JSON)
+    llama_documents: Optional[List[Any]] = Field(default=None, exclude=True, description="LlamaIndex documents loaded from repo")
+
     # Aggregate metrics
     total_files: int = 0
     total_chunks: int = 0
@@ -259,91 +262,3 @@ class OnboardingJob(BaseModel):
 
         return min(int(base), 100)
 
-
-class VectorStore(ABC):
-    """Abstract interface for vector database operations."""
-
-    @abstractmethod
-    def create_collection(self, collection_name: str) -> None:
-        """
-        Create a new collection for storing embeddings.
-
-        Args:
-            collection_name: Name of the collection
-        """
-        pass
-
-    @abstractmethod
-    def delete_collection(self, collection_name: str) -> None:
-        """
-        Delete a collection and all its data.
-
-        Args:
-            collection_name: Name of the collection to delete
-        """
-        pass
-
-    @abstractmethod
-    def collection_exists(self, collection_name: str) -> bool:
-        """
-        Check if a collection exists.
-
-        Args:
-            collection_name: Name of the collection
-
-        Returns:
-            True if collection exists, False otherwise
-        """
-        pass
-
-    @abstractmethod
-    def add_documents(
-        self,
-        collection_name: str,
-        chunks: List[CodeChunk]
-    ) -> None:
-        """
-        Add documents to a collection.
-        Embeddings are generated automatically by the vector store's embedding provider.
-
-        Args:
-            collection_name: Name of the collection
-            chunks: List of code chunks to add
-        """
-        pass
-
-    @abstractmethod
-    def search(
-        self,
-        collection_name: str,
-        query_text: str,
-        top_k: int = 5,
-        filter_metadata: Optional[Dict[str, Any]] = None
-    ) -> List[SearchResult]:
-        """
-        Search for similar documents using vector similarity.
-        Query embedding is generated automatically by the vector store's embedding provider.
-
-        Args:
-            collection_name: Name of the collection to search
-            query_text: Query text (embedding will be generated automatically)
-            top_k: Number of results to return
-            filter_metadata: Optional metadata filters
-
-        Returns:
-            List of search results sorted by similarity
-        """
-        pass
-
-    @abstractmethod
-    def get_collection_count(self, collection_name: str) -> int:
-        """
-        Get the number of documents in a collection.
-
-        Args:
-            collection_name: Name of the collection
-
-        Returns:
-            Number of documents in the collection
-        """
-        pass
