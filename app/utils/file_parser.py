@@ -288,7 +288,7 @@ class PythonParser(FileParser):
 class GenericParser(FileParser):
     """Generic parser for non-Python files - creates file-level and line-based segment chunks."""
 
-    def __init__(self, repo_url: str, lines_per_segment: int = 50):
+    def __init__(self, repo_url: str, lines_per_segment: int = 500):
         """
         Initialize generic parser.
 
@@ -317,14 +317,13 @@ class GenericParser(FileParser):
             content = self.read_file_content(file_path)
             chunks = []
 
-            # TODO: should we keep file-level chunk for generic files?
-            # Always create a file-level chunk
-            # file_chunk = self.create_file_chunk(content, relative_path, language)
-            # chunks.append(file_chunk)
-
             # Create segment chunks for every N lines
             segment_chunks = self._create_segment_chunks(content, relative_path, language)
-            chunks.extend(segment_chunks)
+            if segment_chunks:
+                chunks.extend(segment_chunks)
+            else:
+                file_chunk = self.create_file_chunk(content, relative_path, language)
+                chunks.append(file_chunk)
 
             return chunks
         except Exception:
