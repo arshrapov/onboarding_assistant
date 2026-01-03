@@ -1,0 +1,98 @@
+services:
+  onboarding-assistant:
+    # Build locally from source
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    # Image name for the built container
+    image: onboarding-assistant:local
+
+    container_name: onboarding-assistant
+
+    # Restart policy
+    restart: unless-stopped
+
+    # Port mapping (host:container)
+    ports:
+      - "${SERVER_PORT:-7860}:7860"
+
+    # Environment variables - REQUIRED configuration
+    environment:
+      # REQUIRED: Gemini API Key
+      - GEMINI_API_KEY=${GEMINI_API_KEY:?GEMINI_API_KEY is required}
+
+      # OPTIONAL: GitHub token for private repos
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+
+      # Server settings
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=7860
+
+      # LLM settings
+      - GEMINI_MODEL=${GEMINI_MODEL:-models/gemini-2.5-flash}
+      - MAX_TOKENS=${MAX_TOKENS:-8192}
+      - TEMPERATURE=${TEMPERATURE:-0.7}
+
+      # Embedding settings
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-models/embedding-001}
+
+      # ChromaDB settings
+      - CHROMA_MODE=${CHROMA_MODE:-embedded}
+      - CHROMA_COLLECTION_PREFIX=${CHROMA_COLLECTION_PREFIX:-onboarding_}
+
+      # RAG configuration
+      - TOP_K_RESULTS=${TOP_K_RESULTS:-10}
+      - CHUNK_SIZE=${CHUNK_SIZE:-3000}
+      - CHUNK_OVERLAP=${CHUNK_OVERLAP:-400}
+
+      # File processing
+      - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-5}
+
+    # Volume mounts for persistent storage
+    volumes:
+      # Persist vector indexes and repository data
+      - onboarding-data:/app/data
+
+      # Optional: Mount custom config
+      # - ./config:/app/config:ro
+
+    # Resource limits (optional, adjust based on your needs)
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7860/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Named volumes for persistent data
+volumes:
+  onboarding-data:
+    driver: local
+    # Optional: specify custom mount point
+    # driver_opts:
+    #   type: none
+    #   o: bind
+    #   device: /path/to/your/data
+
+# Networks (optional)
+networks:
+  default:
+    name: onboarding-network
