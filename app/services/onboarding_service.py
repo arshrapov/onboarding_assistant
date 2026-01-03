@@ -226,15 +226,36 @@ class RepositoryOnboardingService:
     async def _handle_parsing(self, job: OnboardingJob, sm: OnboardingStateMachine) -> None:
         """
         Handle the parsing state - process LlamaIndex documents and stream chunks to vector store.
-        This state now includes all indexing operations.
+        This state now includes all indexing operations and metadata collection.
         """
         logger.info(f"Job {job.job_id}: Starting PARSING phase with {len(job.llama_documents)} documents")
         sm.start_state(OnboardingState.PARSING)
         self._update_job(job)
 
         try:
-            logger.debug(f"Job {job.job_id}: Creating index in collection {job.collection_name}")
+            # Step 1: Collect overview metadata from documents
+            logger.debug(f"Job {job.job_id}: Collecting overview metadata from documents")
             loop = asyncio.get_event_loop()
+            overview_metadata = await loop.run_in_executor(
+                None,
+                self.rag_engine.collect_overview_metadata,
+                job.llama_documents
+            )
+
+            # Store metadata in job for later use in overview generation
+            job.metadata_for_overview = overview_metadata.get("special_files", {})
+            job.total_files = overview_metadata["stats"]["total_files"]
+            job.languages_detected = list(overview_metadata["stats"]["languages"].keys())
+
+            # Store additional metadata as JSON in job
+            job.overview_metadata = overview_metadata
+
+            logger.info(f"Job {job.job_id}: Collected metadata - {job.total_files} files, "
+                       f"{len(job.metadata_for_overview)} special files, "
+                       f"languages: {job.languages_detected}")
+
+            # Step 2: Create index in vector store
+            logger.debug(f"Job {job.job_id}: Creating index in collection {job.collection_name}")
             await loop.run_in_executor(
                 None,
                 self.rag_engine.create_index,
@@ -314,65 +335,55 @@ class RepositoryOnboardingService:
 
     def _analyze_collected_files(self, job: OnboardingJob) -> Dict[str, any]:
         """
-        Analyze files collected during parsing.
+        Analyze files collected during parsing using the structured metadata.
 
         Returns:
-            Dictionary with extracted information
+            Dictionary with extracted information for LLM synthesis
         """
-        logger.debug(f"Job {job.job_id}: Analyzing {len(job.metadata_for_overview)} metadata files")
+        logger.debug(f"Job {job.job_id}: Analyzing collected metadata")
+
+        # Use the new structured metadata from RAG engine
+        metadata = job.overview_metadata
+
+        # Build file_data from the structured metadata
         file_data = {
             "readme_content": "",
-            "dependencies": [],
-            "tech_stack": set(job.languages_detected),
+            "dependencies": metadata.get("package_info", {}).get("top_dependencies", []),
+            "tech_stack": list(metadata.get("stats", {}).get("languages", {}).keys()),
             "config_files": [],
-            "has_docker": False,
-            "package_info": {}
+            "has_docker": metadata.get("patterns", {}).get("has_docker", False),
+            "package_info": metadata.get("package_info", {}),
+            "frameworks": metadata.get("patterns", {}).get("frameworks", []),
+            "entry_points": metadata.get("patterns", {}).get("entry_points", []),
+            "has_tests": metadata.get("patterns", {}).get("has_tests", False),
+            "has_ci_cd": metadata.get("patterns", {}).get("has_ci_cd", False),
+            "project_type": metadata.get("patterns", {}).get("project_type", "unknown"),
+            "total_files": metadata.get("stats", {}).get("total_files", 0),
+            "total_size_mb": round(metadata.get("stats", {}).get("total_size_bytes", 0) / 1024 / 1024, 2),
         }
 
-        for file_path, content in job.metadata_for_overview.items():
+        # Extract README from special files
+        special_files = metadata.get("special_files", {})
+        for file_path, content in special_files.items():
             filename_lower = Path(file_path).name.lower()
 
-            # Extract README
             if filename_lower.startswith('readme'):
-                file_data["readme_content"] = content[:5000]  # Limit to first 5000 chars
+                file_data["readme_content"] = content[:5000]
                 logger.debug(f"Job {job.job_id}: Found README: {file_path}")
+                break  # Use first README found
 
-            # Extract dependencies from requirements.txt
-            elif filename_lower == 'requirements.txt':
-                deps = [line.strip().split('==')[0].split('>=')[0].split('<=')[0]
-                       for line in content.split('\n')
-                       if line.strip() and not line.strip().startswith('#')]
-                file_data["dependencies"].extend(deps[:20])  # Limit to 20
-                logger.debug(f"Job {job.job_id}: Found {len(deps)} dependencies in requirements.txt")
+        # Collect config files
+        file_data["config_files"] = [
+            path for path in special_files.keys()
+            if Path(path).name.lower() in ['cargo.toml', 'go.mod', 'pom.xml', 'pyproject.toml',
+                                           'package.json', 'requirements.txt', 'dockerfile']
+        ]
 
-            # Extract from package.json
-            elif filename_lower == 'package.json':
-                try:
-                    import json
-                    pkg = json.loads(content)
-                    file_data["package_info"] = {
-                        "name": pkg.get("name"),
-                        "description": pkg.get("description"),
-                        "scripts": list(pkg.get("scripts", {}).keys())
-                    }
-                    if "dependencies" in pkg:
-                        file_data["dependencies"].extend(list(pkg["dependencies"].keys())[:20])
-                    logger.debug(f"Job {job.job_id}: Extracted package.json data for {pkg.get('name', 'unknown')}")
-                except Exception as e:
-                    logger.warning(f"Job {job.job_id}: Failed to parse package.json: {e}")
+        logger.debug(f"Job {job.job_id}: File analysis complete - "
+                    f"tech stack: {file_data['tech_stack']}, "
+                    f"frameworks: {file_data['frameworks']}, "
+                    f"project type: {file_data['project_type']}")
 
-            # Detect frameworks from package files
-            elif filename_lower in ['cargo.toml', 'go.mod', 'pom.xml']:
-                file_data["config_files"].append(file_path)
-                logger.debug(f"Job {job.job_id}: Found config file: {file_path}")
-
-            # Docker detection
-            elif filename_lower == 'dockerfile':
-                file_data["has_docker"] = True
-                logger.debug(f"Job {job.job_id}: Found Dockerfile")
-
-        file_data["tech_stack"] = list(file_data["tech_stack"])
-        logger.debug(f"Job {job.job_id}: File analysis complete - tech stack: {file_data['tech_stack']}")
         return file_data
 
     def _query_rag_for_insights(self, collection_name: str, file_data: Optional[Dict] = None) -> Dict[str, str]:
@@ -435,21 +446,38 @@ class RepositoryOnboardingService:
             Generated overview in Russian
         """
         logger.debug(f"Job {job.job_id}: Synthesizing overview with LLM")
-        # Build context for LLM
-        print(file_data)
-        print(file_data.get('readme_content', 'Не найден'))
+
+        # Build context for LLM with enhanced metadata
         context = f"""
 Проанализируй следующую информацию о репозитории и создай структурированный обзор.
 
 ИНФОРМАЦИЯ ИЗ ФАЙЛОВ:
 README: {file_data.get('readme_content', 'Не найден')[:1000]}
-Зависимости: {', '.join(file_data.get('dependencies', [])[:15])}
-Языки программирования: {', '.join(file_data.get('tech_stack', []))}
 Имя проекта: {file_data.get('package_info', {}).get('name', 'Неизвестно')}
-Описание из package.json: {file_data.get('package_info', {}).get('description', 'Нет')}
+Описание: {file_data.get('package_info', {}).get('description', 'Нет')}
+Версия: {file_data.get('package_info', {}).get('version', 'Нет')}
+Лицензия: {file_data.get('package_info', {}).get('license', 'Нет')}
+
+СТАТИСТИКА:
+Количество файлов: {file_data.get('total_files', 0)}
+Размер кодовой базы: {file_data.get('total_size_mb', 0)} MB
+Тип проекта: {file_data.get('project_type', 'unknown')}
+
+ТЕХНОЛОГИЧЕСКИЙ СТЕК:
+Языки программирования: {', '.join(file_data.get('tech_stack', []))}
+Фреймворки: {', '.join(file_data.get('frameworks', []))}
+Зависимости ({file_data.get('package_info', {}).get('dependencies_count', 0)}): {', '.join(file_data.get('dependencies', [])[:15])}
+
+ИНФРАСТРУКТУРА:
 Docker: {'Да' if file_data.get('has_docker') else 'Нет'}
-Количество файлов: {job.total_files}
-Количество чанков кода: {job.total_chunks}
+CI/CD: {'Да' if file_data.get('has_ci_cd') else 'Нет'}
+Тесты: {'Да' if file_data.get('has_tests') else 'Нет'}
+
+ТОЧКИ ВХОДА:
+{', '.join(file_data.get('entry_points', [])) if file_data.get('entry_points') else 'Не найдены'}
+
+ФАЙЛЫ КОНФИГУРАЦИИ:
+{', '.join([Path(f).name for f in file_data.get('config_files', [])])}
 
 ИНФОРМАЦИЯ ИЗ АНАЛИЗА КОДА (RAG):
 Точки входа:

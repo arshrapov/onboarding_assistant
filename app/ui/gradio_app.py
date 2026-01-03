@@ -5,7 +5,6 @@ Main Gradio application for Onboarding Assistant UI.
 import gradio as gr
 from typing import List, Tuple, Optional
 import pandas as pd
-from datetime import datetime
 
 from app.services.onboarding_service import RepositoryOnboardingService
 from app.core.models import OnboardingJob, OnboardingState
@@ -77,15 +76,25 @@ def _create_add_repository_tab(service: RepositoryOnboardingService) -> None:
     # Start button
     start_btn = gr.Button("🚀 Начать индексацию", variant="primary", size="lg")
 
-    # Status output
-    with gr.Group():
-        status_output = gr.Markdown("")
-        progress_output = gr.Textbox(
-            label="Прогресс",
-            lines=10,
-            interactive=False,
-            visible=False
-        )
+    # Status and progress section
+    with gr.Group(visible=False) as progress_group:
+        gr.Markdown("### 🔄 Статус индексации")
+
+        # Current state display
+        current_state = gr.Markdown("")
+
+        # Detailed progress information
+        with gr.Accordion("📊 Детальный прогресс", open=True):
+            progress_details = gr.Markdown("")
+
+    # Overview section (shown after completion)
+    with gr.Group(visible=False) as overview_group:
+        gr.Markdown("### ✅ Индексация завершена!")
+        overview_display = gr.Markdown("")
+        view_repo_btn = gr.Button("📋 Перейти к списку репозиториев", variant="secondary")
+
+    # Hidden state to track current job ID
+    current_job_id = gr.State(None)
 
     # Help section
     with gr.Accordion("💡 Информация", open=False):
@@ -119,14 +128,22 @@ def _create_add_repository_tab(service: RepositoryOnboardingService) -> None:
 
         return "✅ URL корректен"
 
-    def start_onboarding(repo_url: str) -> Tuple[str, str, bool]:
+    def start_onboarding(repo_url: str):
         """Start repository onboarding process."""
         if not repo_url:
-            return "❌ Ошибка: Введите URL репозитория", "", False
+            return {
+                progress_group: gr.update(visible=False),
+                overview_group: gr.update(visible=False),
+                current_job_id: None
+            }
 
         validation = validate_url(repo_url)
         if not validation.startswith("✅"):
-            return f"❌ Ошибка: {validation}", "", False
+            return {
+                progress_group: gr.update(visible=False),
+                overview_group: gr.update(visible=False),
+                current_job_id: None
+            }
 
         try:
             # Create job
@@ -148,27 +165,106 @@ def _create_add_repository_tab(service: RepositoryOnboardingService) -> None:
             thread = threading.Thread(target=run_job_async, daemon=True)
             thread.start()
 
-            status_msg = f"""
-### ✅ Индексация начата!
-
+            # Show progress group
+            return {
+                progress_group: gr.update(visible=True),
+                overview_group: gr.update(visible=False),
+                current_job_id: job.job_id,
+                current_state: f"🔵 **{job.current_state}**",
+                progress_details: f"""
 **ID задачи:** `{job.job_id}`
 **Репозиторий:** {job.repo_url}
-**Статус:** {job.current_state}
 **Создано:** {job.created_at.strftime("%Y-%m-%d %H:%M:%S")}
-
-Проверяйте прогресс во вкладке **"Список репозиториев"**
 """
+            }
 
-            progress_msg = f"[{datetime.now().strftime('%H:%M:%S')}] Задача создана: {job.job_id}\n"
-            progress_msg += f"[{datetime.now().strftime('%H:%M:%S')}] Статус: {job.current_state}\n"
-            progress_msg += f"[{datetime.now().strftime('%H:%M:%S')}] Начинается клонирование репозитория...\n"
-
-            return status_msg, progress_msg, True
-
-        except Exception as e:
+        except Exception:
             import traceback
             print(f"Error starting onboarding: {traceback.format_exc()}")
-            return f"❌ Ошибка: {str(e)}", "", False
+            return {
+                progress_group: gr.update(visible=False),
+                overview_group: gr.update(visible=False),
+                current_job_id: None
+            }
+
+    def poll_job_status(job_id: str):
+        """Poll job status and update UI."""
+        import time
+
+        if not job_id:
+            return {
+                progress_group: gr.update(visible=False),
+                overview_group: gr.update(visible=False)
+            }
+
+        # Poll for updates
+        max_polls = 600  # 10 minutes (600 * 1 second)
+        for _ in range(max_polls):
+            job = service.get_job_status(job_id)
+            if not job:
+                break
+
+            # Calculate progress
+            progress_percent = job.calculate_progress_percent()
+
+            # State-specific icons and messages
+            state_str = job.current_state if isinstance(job.current_state, str) else job.current_state.value
+            state_icons = {
+                "created": "⚪",
+                "cloning": "🔵",
+                "parsing": "🟡",
+                "generating_overview": "🟠",
+                "completed": "✅",
+                "failed": "❌"
+            }
+            icon = state_icons.get(state_str, "⚪")
+
+            # Build progress details
+            details = f"""
+**ID задачи:** `{job.job_id}`
+**Репозиторий:** {job.repo_url}
+**Прогресс:** {progress_percent}%
+**Текущий статус:** {icon} {state_str}
+
+---
+
+**📊 Статистика:**
+- Файлов обработано: {job.total_files}
+- Чанков создано: {job.total_chunks}
+- Языки: {', '.join(job.languages_detected[:5]) if job.languages_detected else 'определяются...'}
+"""
+
+            if job.error:
+                details += f"\n\n**❌ Ошибка:**\n```\n{job.error}\n```"
+
+            # Yield progress update
+            yield {
+                current_state: f"{icon} **{state_str}** ({progress_percent}%)",
+                progress_details: details,
+                progress_group: gr.update(visible=True),
+                overview_group: gr.update(visible=False)
+            }
+
+            # Check if completed or failed
+            if state_str in ["completed", "failed"]:
+                # Show overview if completed
+                if state_str == "completed":
+                    overview_text = ""
+                    if job.project_overview:
+                        overview_text = job.project_overview
+                    else:
+                        overview_text = "*Обзор не был сгенерирован*"
+
+                    yield {
+                        current_state: f"✅ **Завершено**",
+                        progress_details: details,
+                        progress_group: gr.update(visible=False),
+                        overview_group: gr.update(visible=True),
+                        overview_display: overview_text
+                    }
+                break
+
+            time.sleep(1)  # Poll every second
 
     # Wire up events
     repo_url_input.change(
@@ -180,7 +276,11 @@ def _create_add_repository_tab(service: RepositoryOnboardingService) -> None:
     start_btn.click(
         fn=start_onboarding,
         inputs=[repo_url_input],
-        outputs=[status_output, progress_output, progress_output]  # Last one controls visibility
+        outputs=[progress_group, overview_group, current_job_id, current_state, progress_details]
+    ).then(
+        fn=poll_job_status,
+        inputs=[current_job_id],
+        outputs=[current_state, progress_details, progress_group, overview_group, overview_display]
     )
 
 

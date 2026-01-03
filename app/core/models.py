@@ -151,6 +151,7 @@ class OnboardingJob(BaseModel):
 
     # Overview generation
     metadata_for_overview: Dict[str, str] = Field(default_factory=dict, description="File contents collected during parsing for overview generation")
+    overview_metadata: Dict[str, Any] = Field(default_factory=dict, description="Structured metadata collected from documents for overview generation")
     project_overview: Optional[str] = Field(None, description="Generated project overview")
 
     # Timestamps
@@ -194,6 +195,7 @@ class OnboardingJob(BaseModel):
             "languages_detected": self.languages_detected,
             "failed_files": self.failed_files,
             "metadata_for_overview": self.metadata_for_overview,
+            "overview_metadata": self.overview_metadata,
             "project_overview": self.project_overview,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
@@ -232,6 +234,7 @@ class OnboardingJob(BaseModel):
             languages_detected=data.get("languages_detected", []),
             failed_files=data.get("failed_files", []),
             metadata_for_overview=data.get("metadata_for_overview", {}),
+            overview_metadata=data.get("overview_metadata", {}),
             project_overview=data.get("project_overview"),
             created_at=datetime.fromisoformat(data["created_at"]),
             updated_at=datetime.fromisoformat(data["updated_at"]),

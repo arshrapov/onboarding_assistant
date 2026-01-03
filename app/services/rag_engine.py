@@ -370,6 +370,210 @@ class RAGEngine:
         except Exception as e:
             print(f"Warning: Could not delete collection {collection_name}: {e}")
 
+    # ==================== Overview Metadata Collection ====================
+
+    def collect_overview_metadata(
+        self,
+        documents: List[Document]
+    ) -> Dict[str, Any]:
+        """
+        Collect metadata for overview generation from documents.
+
+        Args:
+            documents: List of LlamaIndex Document objects
+
+        Returns:
+            Dictionary with collected metadata for overview generation
+        """
+        import json
+        from collections import Counter
+
+        overview_data = {
+            "stats": {
+                "total_files": 0,
+                "total_size_bytes": 0,
+                "avg_file_size": 0.0,
+                "languages": {},
+            },
+            "special_files": {},
+            "patterns": {
+                "frameworks": set(),
+                "entry_points": [],
+                "has_tests": False,
+                "has_docker": False,
+                "has_ci_cd": False,
+                "project_type": "unknown",
+            },
+            "package_info": {
+                "name": None,
+                "version": None,
+                "description": None,
+                "license": None,
+                "dependencies_count": 0,
+                "top_dependencies": [],
+            }
+        }
+
+        # Special files to collect (case-insensitive)
+        special_files_set = {
+            # Documentation
+            'readme.md', 'readme.rst', 'readme.txt', 'readme',
+            'contributing.md', 'changelog.md', 'history.md',
+            # Package/dependency files
+            'requirements.txt', 'pyproject.toml', 'setup.py', 'pipfile',
+            'package.json', 'package-lock.json', 'yarn.lock',
+            'cargo.toml', 'go.mod', 'go.sum',
+            'pom.xml', 'build.gradle', 'build.gradle.kts',
+            'gemfile', 'gemfile.lock',
+            # Configuration files
+            'dockerfile', 'docker-compose.yml', 'docker-compose.yaml',
+            '.dockerignore',
+            'makefile', 'cmakelists.txt',
+            '.env.example', 'config.yaml', 'config.yml', 'config.json',
+            # CI/CD
+            '.travis.yml', '.gitlab-ci.yml', 'jenkinsfile',
+            'license', 'license.txt', 'license.md',
+        }
+
+        language_counter = Counter()
+        total_size = 0
+
+        for doc in documents:
+            file_path = doc.metadata.get('file_path', '')
+            file_name = Path(file_path).name.lower()
+            language = doc.metadata.get('language', 'Unknown')
+            content = doc.text
+            content_size = len(content)
+
+            # Update statistics
+            overview_data["stats"]["total_files"] += 1
+            total_size += content_size
+            language_counter[language] += 1
+
+            # Collect special files (limit depth and size)
+            parts = Path(file_path).parts
+            depth = len(parts)
+
+            # Only collect files at root or first level, max 5000 chars
+            if depth <= 2 and file_name in special_files_set and content_size <= 500_000:
+                overview_data["special_files"][file_path] = content[:5000]
+
+            # Detect patterns
+            # Entry points
+            if file_name in ['main.py', '__main__.py', 'app.py', 'index.js',
+                           'main.go', 'main.rs', 'main.java', 'main.cpp']:
+                overview_data["patterns"]["entry_points"].append(file_path)
+
+            # Tests
+            if 'test' in file_path.lower() or file_name.startswith('test_'):
+                overview_data["patterns"]["has_tests"] = True
+
+            # Docker
+            if file_name in ['dockerfile', 'docker-compose.yml', 'docker-compose.yaml']:
+                overview_data["patterns"]["has_docker"] = True
+
+            # CI/CD
+            if '.github/workflows' in file_path or file_name in ['.travis.yml', '.gitlab-ci.yml', 'jenkinsfile']:
+                overview_data["patterns"]["has_ci_cd"] = True
+
+            # Framework detection (from content)
+            if language == 'Python':
+                if 'from fastapi import' in content or 'import fastapi' in content:
+                    overview_data["patterns"]["frameworks"].add('FastAPI')
+                if 'from flask import' in content or 'import flask' in content:
+                    overview_data["patterns"]["frameworks"].add('Flask')
+                if 'from django' in content or 'import django' in content:
+                    overview_data["patterns"]["frameworks"].add('Django')
+            elif language == 'JavaScript' or language == 'TypeScript':
+                if 'from react' in content or "from 'react'" in content or 'import React' in content:
+                    overview_data["patterns"]["frameworks"].add('React')
+                if 'from vue' in content or "from 'vue'" in content:
+                    overview_data["patterns"]["frameworks"].add('Vue')
+                if 'express()' in content or "require('express')" in content:
+                    overview_data["patterns"]["frameworks"].add('Express')
+
+            # Parse package.json
+            if file_name == 'package.json':
+                try:
+                    pkg = json.loads(content)
+                    overview_data["package_info"]["name"] = pkg.get("name")
+                    overview_data["package_info"]["version"] = pkg.get("version")
+                    overview_data["package_info"]["description"] = pkg.get("description")
+                    overview_data["package_info"]["license"] = pkg.get("license")
+
+                    deps = list(pkg.get("dependencies", {}).keys())
+                    dev_deps = list(pkg.get("devDependencies", {}).keys())
+                    all_deps = deps + dev_deps
+                    overview_data["package_info"]["dependencies_count"] = len(all_deps)
+                    overview_data["package_info"]["top_dependencies"] = all_deps[:15]
+                except Exception as e:
+                    print(f"Warning: Could not parse package.json: {e}")
+
+            # Parse requirements.txt
+            elif file_name == 'requirements.txt':
+                try:
+                    deps = [
+                        line.strip().split('==')[0].split('>=')[0].split('<=')[0].split('[')[0]
+                        for line in content.split('\n')
+                        if line.strip() and not line.strip().startswith('#')
+                    ]
+                    overview_data["package_info"]["dependencies_count"] = len(deps)
+                    overview_data["package_info"]["top_dependencies"] = deps[:15]
+                except Exception as e:
+                    print(f"Warning: Could not parse requirements.txt: {e}")
+
+            # Parse pyproject.toml
+            elif file_name == 'pyproject.toml':
+                try:
+                    # Simple regex-based parsing for common fields
+                    if 'name = ' in content:
+                        for line in content.split('\n'):
+                            if line.strip().startswith('name ='):
+                                overview_data["package_info"]["name"] = line.split('=')[1].strip().strip('"\'')
+                            elif line.strip().startswith('version ='):
+                                overview_data["package_info"]["version"] = line.split('=')[1].strip().strip('"\'')
+                            elif line.strip().startswith('description ='):
+                                overview_data["package_info"]["description"] = line.split('=')[1].strip().strip('"\'')
+                except Exception as e:
+                    print(f"Warning: Could not parse pyproject.toml: {e}")
+
+        # Finalize statistics
+        overview_data["stats"]["total_size_bytes"] = total_size
+        if overview_data["stats"]["total_files"] > 0:
+            overview_data["stats"]["avg_file_size"] = total_size / overview_data["stats"]["total_files"]
+
+        # Convert language counter to dict
+        overview_data["stats"]["languages"] = {
+            lang: count for lang, count in language_counter.most_common()
+        }
+
+        # Convert frameworks set to list
+        overview_data["patterns"]["frameworks"] = list(overview_data["patterns"]["frameworks"])
+
+        # Detect project type
+        has_setup_py = any('setup.py' in f for f in overview_data["special_files"].keys())
+        has_init_py = any('__init__.py' in doc.metadata.get('file_path', '') for doc in documents)
+        has_api_routes = any(
+            'route' in doc.text.lower() or 'endpoint' in doc.text.lower() or '@app.' in doc.text
+            for doc in documents[:100]  # Check first 100 docs for performance
+        )
+        has_main = len(overview_data["patterns"]["entry_points"]) > 0
+
+        if has_api_routes or 'FastAPI' in overview_data["patterns"]["frameworks"] or 'Flask' in overview_data["patterns"]["frameworks"]:
+            overview_data["patterns"]["project_type"] = "web_service"
+        elif (has_setup_py or has_init_py) and not has_main:
+            overview_data["patterns"]["project_type"] = "library"
+        elif has_main:
+            overview_data["patterns"]["project_type"] = "application"
+        else:
+            overview_data["patterns"]["project_type"] = "mixed"
+
+        print(f"Collected overview metadata: {overview_data['stats']['total_files']} files, "
+              f"{len(overview_data['special_files'])} special files, "
+              f"{len(overview_data['patterns']['frameworks'])} frameworks detected")
+
+        return overview_data
+
     # ==================== Document Management ====================
 
     def search(
