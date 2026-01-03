@@ -315,7 +315,7 @@ def _create_repository_list_tab(service: RepositoryOnboardingService) -> None:
             short_id = job.job_id[:8]
 
             # Extract repo name from URL
-            repo_name = job.repo_url.split('/')[-1] if '/' in job.repo_url else job.repo_url
+            repo_name = job.repo_url.rstrip('/').split('/')[-1] if '/' in job.repo_url else job.repo_url
 
             # Format dates
             created = job.created_at.strftime("%Y-%m-%d %H:%M")
@@ -439,7 +439,7 @@ def _create_qa_tab(service: RepositoryOnboardingService) -> None:
         """Get list of completed repositories for dropdown."""
         jobs = service.list_jobs()
         completed = [
-            (f"{job.repo_url.split('/')[-1]} ({job.job_id[:8]})", job.job_id)
+            (f"{job.repo_url.rstrip('/').split('/')[-1]} ({job.job_id[:8]})", job.job_id)
             for job in jobs
             if (job.current_state == OnboardingState.COMPLETED or
                 job.current_state == "completed")
@@ -534,27 +534,15 @@ def _create_qa_tab(service: RepositoryOnboardingService) -> None:
             if state_str != "completed":
                 return history + [(question, f"❌ Репозиторий еще не готов. Статус: {state_str}")], ""
 
-            # Build context from conversation history
-            from app.ui.utils.state_manager import ConversationManager
-            context = ConversationManager.get_context(history, max_turns=5)
-
-            # Enhance question with context if needed
-            enhanced_question = question
-            if context and len(history) > 0:
-                enhanced_question = f"""Предыдущий контекст диалога:
-{context}
-
-Текущий вопрос: {question}
-
-Пожалуйста, учитывай предыдущий контекст при ответе."""
-
-            # Query RAG engine
+            # Query RAG engine with conversation history
             from app.services.rag_engine import RAGEngine
             rag_engine = RAGEngine()
 
             answer = rag_engine.answer_question(
                 collection_name=job.collection_name,
-                question=question, # TOOD: we should pass the history and the question to that function 
+                question=question,
+                project_overview=job.project_overview,
+                chat_history=history  # Pass conversation history for multi-turn context
             )
 
             # Format answer with syntax highlighting and references
@@ -562,6 +550,7 @@ def _create_qa_tab(service: RepositoryOnboardingService) -> None:
             formatted_answer = format_answer_with_code(answer)
 
             # Add to history
+            from app.ui.utils.state_manager import ConversationManager
             new_history = ConversationManager.add_turn(history, question, formatted_answer)
 
             return new_history, ""  # Return history and clear input

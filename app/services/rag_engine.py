@@ -15,12 +15,12 @@ from llama_index.core import (
     Settings,
     StorageContext
 )
+from llama_index.core.node_parser import SentenceSplitter
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.embeddings.gemini import GeminiEmbedding
 from llama_index.llms.gemini import Gemini
 from llama_index.readers.github import GithubRepositoryReader, GithubClient
 from llama_index.core.storage.docstore import SimpleDocumentStore
-from llama_index.core.query_engine import RetrieverQueryEngine
 import chromadb
 
 # CodeChunk and SearchResult removed - working directly with LlamaIndex Documents
@@ -77,7 +77,12 @@ class RAGEngine:
             api_key=settings.gemini_api_key,
             model_name=settings.embedding_model
         )
-        
+
+        # Configure text splitter for chunking
+        Settings.text_splitter = SentenceSplitter(
+            chunk_size=settings.chunk_size,
+            chunk_overlap=settings.chunk_overlap
+        )
 
         # Initialize ChromaDB client
         self.chroma_client = chromadb.PersistentClient(
@@ -154,7 +159,7 @@ class RAGEngine:
                 github_client=github_client,
                 owner=owner,
                 repo=repo_name,
-                use_parser=True,  # Get raw content
+                use_parser=False,  # Get raw content
                 verbose=True,
                 filter_directories=(
                     ["node_modules", ".git", "__pycache__", "venv", ".venv",
@@ -261,6 +266,15 @@ class RAGEngine:
             if not documents:
                 raise ValueError(f"No documents found for {repo_url}")
 
+        # IMPORTANT: Prepend file path to document text to make files searchable by name
+        # This allows both vector search and BM25 to find files by their path/name
+        for doc in documents:
+            file_path = doc.metadata.get('file_path', '')
+            file_name = doc.metadata.get('file_name', '')
+            if file_path and not doc.text.startswith(f"FILE: {file_path}"):
+                # Add file path header to the beginning of the document
+                doc.text = f"FILE: {file_path}\nFILENAME: {file_name}\n\n{doc.text}"
+
         docstore = SimpleDocumentStore()
         docstore.add_documents(documents)
 
@@ -318,14 +332,9 @@ class RAGEngine:
             try:
                 with open(docstore_path, 'rb') as f:
                     docstore = pickle.load(f)
-                print(f"DEBUG load_index: Loaded docstore with {len(docstore.get_all_document_hashes())} documents")
             except Exception as e:
-                import traceback
                 print(f"Warning: Could not load docstore: {e}")
-                print(f"Traceback:\n{traceback.format_exc()}")
                 docstore = None
-        else:
-            print(f"DEBUG load_index: No docstore file found at {docstore_path}")
 
         # Create index from vector store
         if docstore is not None:
@@ -339,7 +348,6 @@ class RAGEngine:
             )
             # Manually attach docstore since from_vector_store doesn't preserve it
             index._docstore = docstore
-            print(f"DEBUG load_index: Manually attached docstore with {len(index.docstore.get_all_document_hashes())} documents")
         else:
             index = VectorStoreIndex.from_vector_store(vector_store)
 
@@ -568,9 +576,6 @@ class RAGEngine:
         else:
             overview_data["patterns"]["project_type"] = "mixed"
 
-        print(f"Collected overview metadata: {overview_data['stats']['total_files']} files, "
-              f"{len(overview_data['special_files'])} special files, "
-              f"{len(overview_data['patterns']['frameworks'])} frameworks detected")
 
         return overview_data
 
@@ -611,15 +616,22 @@ class RAGEngine:
         self,
         collection_name: str,
         question: str,
-        top_k: Optional[int] = None
+        project_overview: Optional[str] = None,
+        top_k: Optional[int] = None,
+        chat_history: Optional[List[tuple[str, str]]] = None
     ) -> str:
         """
-        Answer a question using RAG with LlamaIndex.
+        Answer a question using RAG with a multi-stage approach:
+        1. Generate search query from question + project overview + chat history
+        2. Retrieve relevant nodes from vector store
+        3. Generate final answer using question + overview + chat history + retrieved context
 
         Args:
             collection_name: Collection to search
             question: User's question
-            top_k: Number of context chunks
+            project_overview: Optional project overview for context
+            top_k: Number of context chunks to retrieve
+            chat_history: Optional list of (question, answer) tuples for conversation context
 
         Returns:
             Generated answer
@@ -630,6 +642,40 @@ class RAGEngine:
         if top_k is None:
             top_k = settings.top_k_results
 
+        # ==================== Stage 1: Generate search query ====================
+        # Build chat history context if available
+        chat_context = ""
+        if chat_history and len(chat_history) > 0:
+            recent_history = chat_history[-3:]  # Use last 3 turns for context
+            history_parts = []
+            for q, a in recent_history:
+                history_parts.append(f"Q: {q}\nA: {a[:200]}...")  # Truncate long answers
+            chat_context = f"\n\nRECENT CONVERSATION:\n" + "\n".join(history_parts)
+
+        # Create a prompt to generate an optimized search query using question + overview + chat history
+        search_query_prompt = f"""
+You are helping to search a codebase. Given the user's question, generate an optimized search query.
+
+USER QUESTION:
+{question}
+
+PROJECT OVERVIEW:
+{project_overview if project_overview else "No overview available"}{chat_context}
+
+If the user is asking for a specific file (e.g., "show system_objects.py"), include the COMPLETE filename in your search query.
+If asking about code concepts, focus on technical terms, function names, class names that would appear in relevant code.
+
+Return ONLY the search query text, nothing else. Make it 1-2 sentences maximum.
+"""
+
+        response = Settings.llm.complete(search_query_prompt)
+        search_query = response.text.strip()
+
+        # Remove markdown code formatting if present
+        if search_query.startswith('`') and search_query.endswith('`'):
+            search_query = search_query[1:-1].strip()
+
+        # ==================== Stage 2: Retrieve relevant nodes ====================
         # Load index
         index = self.load_index(collection_name)
 
@@ -641,23 +687,14 @@ class RAGEngine:
             try:
                 # Try to get documents from docstore to verify it's populated
                 doc_ids = index.docstore.get_all_document_hashes()
-                print(f"DEBUG: Docstore has {len(doc_ids)} documents")
                 if doc_ids and len(doc_ids) > 0:
-                    print(f"DEBUG: Creating BM25 retriever with {len(doc_ids)} documents")
                     retrievers.append(
                         BM25Retriever.from_defaults(
                             docstore=index.docstore, similarity_top_k=top_k
                         )
                     )
-                    print("DEBUG: BM25 retriever created successfully")
-                else:
-                    print("Warning: Docstore exists but has no documents, skipping BM25 retriever")
             except Exception as e:
-                import traceback
                 print(f"Warning: Could not create BM25 retriever: {e}")
-                print(f"Full traceback:\n{traceback.format_exc()}")
-        else:
-            print(f"Warning: No docstore available (has_attr={hasattr(index, 'docstore')}, is_none={index.docstore is None if hasattr(index, 'docstore') else 'N/A'}), using only vector retriever")
 
         # Create retriever (fusion if we have multiple, otherwise single)
         if len(retrievers) > 1:
@@ -669,13 +706,57 @@ class RAGEngine:
         else:
             retriever = retrievers[0]
 
-        # Create query engine
-        query_engine = RetrieverQueryEngine(retriever)
+        # Retrieve nodes using the generated search query
+        retrieved_nodes = retriever.retrieve(search_query)
 
-        # Query
-        response = query_engine.query(question)
+        # ==================== Stage 3: Generate final answer ====================
+        # Build context from retrieved nodes
+        context_parts = []
+        for idx, node in enumerate(retrieved_nodes, 1):
+            node_text = node.text if hasattr(node, 'text') else str(node)
+            file_path = node.metadata.get('file_path', 'Unknown') if hasattr(node, 'metadata') else 'Unknown'
+            score = node.score if hasattr(node, 'score') else 'N/A'
 
-        return str(response)
+            context_parts.append(f"""
+--- Context {idx} (Score: {score}) ---
+File: {file_path}
+Content:
+{node_text}
+""")
+
+        context_str = "\n".join(context_parts)
+
+        # Build conversation history for final prompt
+        conversation_context = ""
+        if chat_history and len(chat_history) > 0:
+            recent_history = chat_history[-5:]  # Use last 5 turns for final answer
+            history_parts = []
+            for i, (q, a) in enumerate(recent_history, 1):
+                history_parts.append(f"Turn {i}:\nUser: {q}\nAssistant: {a[:300]}...")  # Truncate long answers
+            conversation_context = f"\n\nCONVERSATION HISTORY:\n" + "\n\n".join(history_parts) + "\n"
+
+        # Create final prompt with all information
+        final_prompt = f"""
+You are an expert assistant helping developers understand a codebase.
+
+PROJECT OVERVIEW:
+{project_overview if project_overview else "No overview available"}{conversation_context}
+
+USER QUESTION:
+{question}
+
+RELEVANT CODE CONTEXT:
+{context_str}
+
+Based on the project overview, conversation history (if any), and the relevant code context above, provide a detailed and accurate answer to the user's question.
+If this is a follow-up question, consider the previous conversation to understand context and references (like "it", "that", "the previous one", etc.).
+If the context doesn't contain enough information to fully answer the question, acknowledge this and provide the best answer you can with the available information.
+Include specific file paths and code references when relevant.
+"""
+
+        final_response = Settings.llm.complete(final_prompt)
+
+        return str(final_response.text)
 
     def get_collection_stats(self, collection_name: str) -> Dict[str, Any]:
         """

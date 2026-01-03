@@ -6,6 +6,7 @@ import uuid
 import json
 import asyncio
 import logging
+import shutil
 from pathlib import Path
 from typing import Dict, Optional, List
 from datetime import datetime
@@ -97,18 +98,80 @@ class RepositoryOnboardingService:
         self.jobs[job.job_id] = job
         self._save_jobs()
 
+    def _find_existing_job_by_repo(self, repo_url: str) -> Optional[OnboardingJob]:
+        """
+        Find an existing job for the same repository URL.
+
+        Args:
+            repo_url: Repository URL to search for
+
+        Returns:
+            Existing OnboardingJob or None if not found
+        """
+        for job in self.jobs.values():
+            if job.repo_url == repo_url:
+                return job
+        return None
+
+    def _cleanup_repository_data(self, job: OnboardingJob) -> None:
+        """
+        Remove all files and data associated with a repository job.
+
+        Args:
+            job: The job whose data should be cleaned up
+        """
+        logger.info(f"Cleaning up repository data for job {job.job_id} (repo: {job.repo_url})")
+
+        # 1. Delete vector index and collection from ChromaDB
+        if job.collection_name:
+            try:
+                logger.debug(f"Deleting ChromaDB collection: {job.collection_name}")
+                self.rag_engine.delete_index(job.collection_name)
+                logger.info(f"Successfully deleted collection: {job.collection_name}")
+            except Exception as e:
+                logger.warning(f"Failed to delete collection {job.collection_name}: {e}")
+
+        # 2. Delete repository files from disk
+        if job.clone_path:
+            try:
+                clone_path = Path(job.clone_path)
+                if clone_path.exists():
+                    logger.debug(f"Deleting repository files at: {clone_path}")
+                    shutil.rmtree(clone_path)
+                    logger.info(f"Successfully deleted repository files: {clone_path}")
+            except Exception as e:
+                logger.warning(f"Failed to delete repository files at {job.clone_path}: {e}")
+
+        # 3. Remove job from stored jobs
+        if job.job_id in self.jobs:
+            logger.debug(f"Removing job {job.job_id} from stored jobs")
+            del self.jobs[job.job_id]
+            self._save_jobs()
+            logger.info(f"Successfully removed job {job.job_id} from storage")
+
     def create_job(self, repo_url: str, force_reclone: bool = False) -> OnboardingJob:
         """
         Create a new onboarding job.
+        If a job for this repository already exists, it will be cleaned up first.
 
         Args:
             repo_url: Repository URL
-            force_reclone: If True, remove existing clone and re-clone
+            force_reclone: If True, remove existing clone and re-clone (kept for compatibility)
 
         Returns:
             Created OnboardingJob
         """
         logger.info(f"Creating new onboarding job for repository: {repo_url}")
+
+        # Check if this repository already has a job
+        existing_job = self._find_existing_job_by_repo(repo_url)
+        if existing_job:
+            logger.info(f"Found existing job {existing_job.job_id} for repository {repo_url}")
+            logger.info(f"Removing existing job and all associated data")
+            self._cleanup_repository_data(existing_job)
+            logger.info(f"Cleanup completed, creating new job for {repo_url}")
+
+        # Create new job
         job_id = str(uuid.uuid4())
         collection_name = create_collection_name(repo_url)
 

@@ -58,7 +58,10 @@ async def start_onboarding(request: OnboardingRequest):
         )
 
     try:
-        # Create job
+        # Check if repository already exists
+        existing_job = onboarding_service._find_existing_job_by_repo(repo_url)
+
+        # Create job (will clean up existing one if found)
         job = onboarding_service.create_job(
             repo_url=repo_url,
             force_reclone=request.force_reclone
@@ -67,12 +70,17 @@ async def start_onboarding(request: OnboardingRequest):
         # Start processing
         onboarding_service.start_job(job.job_id)
 
+        # Customize message based on whether this is a replacement
+        message = "Repository onboarding started in background"
+        if existing_job:
+            message = f"Existing repository data cleaned up. New onboarding started in background (replaced job {existing_job.job_id})"
+
         return OnboardingResponse(
             job_id=job.job_id,
             status=job.current_state,
             repo_url=job.repo_url,
             collection_name=job.collection_name,
-            message="Repository onboarding started in background",
+            message=message,
             progress_percent=job.calculate_progress_percent()
         )
 
