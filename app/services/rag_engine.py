@@ -372,37 +372,6 @@ class RAGEngine:
 
     # ==================== Document Management ====================
 
-    def add_documents(self, collection_name: str, documents: List[Document]) -> None:
-        """
-        Add documents to an existing index.
-
-        Args:
-            collection_name: Collection name
-            documents: List of LlamaIndex Documents to add
-        """
-        if not documents:
-            return
-
-        # Get or create index
-        if self.index_exists(collection_name):
-            index = self.load_index(collection_name)
-        else:
-            # Create new index
-            chroma_collection = self.chroma_client.get_or_create_collection(
-                name=collection_name
-            )
-            vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
-            storage_context = StorageContext.from_defaults(vector_store=vector_store)
-            index = VectorStoreIndex.from_documents(
-                [],
-                storage_context=storage_context
-            )
-            self.indexes[collection_name] = index
-
-        # Insert documents into index
-        for doc in documents:
-            index.insert(doc)
-
     def search(
         self,
         collection_name: str,
