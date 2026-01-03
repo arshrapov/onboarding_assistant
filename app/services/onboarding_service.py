@@ -5,6 +5,7 @@ Repository onboarding service - orchestrates the full onboarding workflow.
 import uuid
 import json
 import asyncio
+import logging
 from pathlib import Path
 from typing import Dict, Optional, List
 from datetime import datetime
@@ -15,6 +16,8 @@ from app.services.state_machine import OnboardingStateMachine
 from app.services.rag_engine import RAGEngine, create_collection_name
 from app.utils.file_filter import filter_repository_files, count_files_by_language
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 # Special files to collect for overview generation
@@ -39,45 +42,57 @@ class RepositoryOnboardingService:
 
     def __init__(self):
         """Initialize the onboarding service."""
+        logger.info("Initializing RepositoryOnboardingService")
         self.jobs: Dict[str, OnboardingJob] = {}
         self.jobs_file = Path(settings.cache_dir) / "onboarding_jobs.json"
         self.rag_engine = RAGEngine()  # Now handles everything: repo loading, indexing, LLM
 
         self._ensure_cache_dir()
         self._load_jobs()
+        logger.info(f"RepositoryOnboardingService initialized with {len(self.jobs)} existing jobs")
 
     def _ensure_cache_dir(self) -> None:
         """Ensure cache directory exists."""
-        Path(settings.cache_dir).mkdir(parents=True, exist_ok=True)
+        cache_path = Path(settings.cache_dir)
+        if not cache_path.exists():
+            logger.info(f"Creating cache directory: {cache_path}")
+        cache_path.mkdir(parents=True, exist_ok=True)
 
     def _load_jobs(self) -> None:
         """Load jobs from JSON file."""
         if self.jobs_file.exists():
             try:
+                logger.info(f"Loading jobs from {self.jobs_file}")
                 with open(self.jobs_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     self.jobs = {
                         job_id: OnboardingJob.from_dict(job_data)
                         for job_id, job_data in data.items()
                     }
+                logger.info(f"Successfully loaded {len(self.jobs)} jobs from file")
             except (json.JSONDecodeError, KeyError, ValueError) as e:
-                print(f"Warning: Could not load onboarding jobs file: {e}")
+                logger.error(f"Could not load onboarding jobs file: {e}", exc_info=True)
                 self.jobs = {}
+        else:
+            logger.info(f"No existing jobs file found at {self.jobs_file}")
 
     def _save_jobs(self) -> None:
         """Save jobs to JSON file."""
         try:
+            logger.debug(f"Saving {len(self.jobs)} jobs to {self.jobs_file}")
             data = {
                 job_id: job.to_dict()
                 for job_id, job in self.jobs.items()
             }
             with open(self.jobs_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
+            logger.debug("Jobs saved successfully")
         except Exception as e:
-            print(f"Error saving onboarding jobs to file: {e}")
+            logger.error(f"Error saving onboarding jobs to file: {e}", exc_info=True)
 
     def _update_job(self, job: OnboardingJob) -> None:
         """Update job in memory and persist to disk."""
+        logger.debug(f"Updating job {job.job_id} (state: {job.current_state})")
         job.updated_at = datetime.utcnow()
         self.jobs[job.job_id] = job
         self._save_jobs()
@@ -93,6 +108,7 @@ class RepositoryOnboardingService:
         Returns:
             Created OnboardingJob
         """
+        logger.info(f"Creating new onboarding job for repository: {repo_url}")
         job_id = str(uuid.uuid4())
         collection_name = create_collection_name(repo_url)
 
@@ -103,6 +119,7 @@ class RepositoryOnboardingService:
         )
 
         self._update_job(job)
+        logger.info(f"Job created successfully: {job_id} (collection: {collection_name})")
         return job
 
     def start_job(self, job_id: str) -> OnboardingJob:
@@ -118,14 +135,18 @@ class RepositoryOnboardingService:
         Raises:
             OnboardingError: If job not found or cannot be started
         """
+        logger.info(f"Starting onboarding job: {job_id}")
         job = self.get_job_status(job_id)
         if not job:
+            logger.error(f"Job not found: {job_id}")
             raise OnboardingError(f"Job {job_id} not found")
 
         if job.current_state != OnboardingState.CREATED:
+            logger.error(f"Job {job_id} cannot be started - already in state {job.current_state}")
             raise OnboardingError(f"Job {job_id} already started (state: {job.current_state})")
 
         # Start the workflow in background
+        logger.info(f"Launching async workflow for job {job_id}")
         asyncio.create_task(self._process_job_async(job))
 
         return job
@@ -137,11 +158,13 @@ class RepositoryOnboardingService:
         Args:
             job: The job to process
         """
+        logger.info(f"Processing job {job.job_id} asynchronously from state {job.current_state}")
         state_machine = OnboardingStateMachine(job)
 
         try:
             # State: CLONING
             if job.current_state == OnboardingState.CREATED:
+                logger.info(f"Job {job.job_id}: Transitioning from CREATED to CLONING")
                 state_machine.transition_to(OnboardingState.CLONING)
                 self._update_job(job)
 
@@ -156,16 +179,21 @@ class RepositoryOnboardingService:
             if job.current_state == OnboardingState.GENERATING_OVERVIEW:
                 await self._handle_generating_overview(job, state_machine)
 
+            logger.info(f"Job {job.job_id} completed successfully in state {job.current_state}")
+
         except Exception as e:
+            logger.error(f"Job {job.job_id} encountered error: {str(e)}", exc_info=True)
             self._handle_error(job, state_machine, e)
 
     async def _handle_cloning(self, job: OnboardingJob, sm: OnboardingStateMachine) -> None:
         """Handle the cloning/loading state using RAG engine."""
+        logger.info(f"Job {job.job_id}: Starting CLONING phase for {job.repo_url}")
         sm.start_state(OnboardingState.CLONING)
         self._update_job(job)
 
         try:
             # Load repository using RAG engine (run in executor to avoid blocking)
+            logger.debug(f"Job {job.job_id}: Loading repository using RAG engine")
             loop = asyncio.get_event_loop()
             clone_path, documents = await loop.run_in_executor(
                 None,
@@ -179,16 +207,20 @@ class RepositoryOnboardingService:
             # Store documents for later use in parsing
             job.llama_documents = documents
 
+            logger.info(f"Job {job.job_id}: Repository loaded successfully - {len(documents)} documents from {clone_path}")
+
             sm.complete_state(OnboardingState.CLONING, {
                 "clone_path": clone_path,
                 "documents_loaded": len(documents)
             })
 
             # Transition to parsing
+            logger.info(f"Job {job.job_id}: Transitioning from CLONING to PARSING")
             sm.transition_to(OnboardingState.PARSING)
             self._update_job(job)
 
         except Exception as e:
+            logger.error(f"Job {job.job_id}: Cloning failed - {str(e)}", exc_info=True)
             raise OnboardingError(f"Cloning error: {str(e)}")
 
     async def _handle_parsing(self, job: OnboardingJob, sm: OnboardingStateMachine) -> None:
@@ -196,227 +228,37 @@ class RepositoryOnboardingService:
         Handle the parsing state - process LlamaIndex documents and stream chunks to vector store.
         This state now includes all indexing operations.
         """
+        logger.info(f"Job {job.job_id}: Starting PARSING phase with {len(job.llama_documents)} documents")
         sm.start_state(OnboardingState.PARSING)
         self._update_job(job)
 
         try:
-            # Use LlamaIndex documents if available
-            if job.llama_documents:
-                await self._handle_parsing_from_llama_documents(job, sm)
-            else:
-                # Fallback to file-based parsing for backward compatibility
-                await self._handle_parsing_from_files(job, sm)
+            logger.debug(f"Job {job.job_id}: Creating index in collection {job.collection_name}")
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                self.rag_engine.create_index,
+                job.repo_url,
+                job.collection_name,
+                job.llama_documents
+            )
+
+            logger.info(f"Job {job.job_id}: Parsing and indexing completed successfully")
+
+            logger.info(f"Job {job.job_id}: Transitioning from PARSING to GENERATING_OVERVIEW")
+            sm.transition_to(OnboardingState.GENERATING_OVERVIEW)
+            self._update_job(job)
 
         except Exception as e:
+            logger.error(f"Job {job.job_id}: Parsing/Indexing failed - {str(e)}", exc_info=True)
             raise OnboardingError(f"Parsing/Indexing error: {str(e)}")
-
-    async def _handle_parsing_from_llama_documents(self, job: OnboardingJob, sm: OnboardingStateMachine) -> None:
-        """
-        Parse using LlamaIndex documents.
-        Add documents directly to the vector store without conversion.
-        """
-        from pathlib import Path
-
-        loop = asyncio.get_event_loop()
-
-        # Get document count and languages
-        job.total_files = len(job.llama_documents)
-        language_counts = {}
-
-        # Create index if it doesn't exist
-        if not self.rag_engine.index_exists(job.collection_name):
-            self.rag_engine.create_index(job.repo_url, job.collection_name)
-
-        # Process documents and add to vector store
-        processed_files = 0
-        total_docs = 0
-        doc_batch = []
-        BATCH_SIZE = 50  # Process documents in batches
-
-        for doc in job.llama_documents:
-            try:
-                file_path = doc.metadata.get('file_path', 'unknown')
-                file_name = doc.metadata.get('file_name', 'unknown')
-
-                # Detect language from file extension
-                file_ext = Path(file_path).suffix.lower()
-                language = self._get_language_from_extension(file_ext)
-                if language:
-                    language_counts[language] = language_counts.get(language, 0) + 1
-
-                # Collect metadata for overview generation
-                if self._is_overview_file_name(file_name):
-                    try:
-                        job.metadata_for_overview[file_path] = doc.text[:500000]  # Limit size
-                    except Exception:
-                        pass
-
-                # Add document to batch
-                doc_batch.append(doc)
-                total_docs += 1
-                processed_files += 1
-
-                # When batch is full, add to vector store
-                if len(doc_batch) >= BATCH_SIZE:
-                    await loop.run_in_executor(
-                        None,
-                        self.rag_engine.add_documents,
-                        job.collection_name,
-                        doc_batch
-                    )
-                    doc_batch = []  # Clear batch
-
-                # Update progress periodically
-                if processed_files % 10 == 0:
-                    metrics = sm.get_state_metrics(OnboardingState.PARSING)
-                    metrics.data["processed_files"] = processed_files
-                    metrics.data["documents_indexed"] = total_docs
-                    self._update_job(job)
-
-            except Exception as e:
-                # Skip failed files, log them
-                job.failed_files.append(file_path)
-                print(f"Error processing {file_path}: {e}")
-
-        # Add remaining documents in batch
-        if doc_batch:
-            await loop.run_in_executor(
-                None,
-                self.rag_engine.add_documents,
-                job.collection_name,
-                doc_batch
-            )
-
-        job.total_chunks = total_docs
-        job.languages_detected = list(language_counts.keys())
-
-        sm.complete_state(OnboardingState.PARSING, {
-            "processed_files": processed_files,
-            "documents_indexed": total_docs,
-            "failed_files": len(job.failed_files),
-            "languages": language_counts,
-            "overview_files_collected": len(job.metadata_for_overview)
-        })
-
-        # Transition to overview generation
-        sm.transition_to(OnboardingState.GENERATING_OVERVIEW)
-        self._update_job(job)
-
-    async def _handle_parsing_from_files(self, job: OnboardingJob, sm: OnboardingStateMachine) -> None:
-        """
-        Parse using file system (fallback/backward compatibility).
-        Note: This path is rarely used since LlamaIndex documents are preferred.
-        """
-        from llama_index.core import Document
-
-        repo_path = Path(job.clone_path)
-
-        # Filter files (only done once!)
-        loop = asyncio.get_event_loop()
-        files = await loop.run_in_executor(
-            None,
-            filter_repository_files,
-            repo_path
-        )
-
-        job.total_files = len(files)
-        language_counts = count_files_by_language(files)
-        job.languages_detected = list(language_counts.keys())
-        self._update_job(job)
-
-        # Create index if it doesn't exist
-        if not self.rag_engine.index_exists(job.collection_name):
-            self.rag_engine.create_index(job.repo_url, job.collection_name)
-
-        # Convert files to documents and add to vector store
-        processed_files = 0
-        total_docs = 0
-        doc_batch = []
-        BATCH_SIZE = 50  # Process documents in batches
-
-        for file_path in files:
-            try:
-                # Collect metadata for overview generation
-                if self._is_overview_file(file_path, repo_path):
-                    try:
-                        content = file_path.read_text(encoding='utf-8', errors='ignore')
-                        relative_path = str(file_path.relative_to(repo_path))
-                        job.metadata_for_overview[relative_path] = content
-                    except Exception:
-                        pass
-
-                # Read file and create Document
-                try:
-                    content = file_path.read_text(encoding='utf-8', errors='ignore')
-                    relative_path = str(file_path.relative_to(repo_path))
-
-                    # Create LlamaIndex Document
-                    doc = Document(
-                        text=content,
-                        metadata={
-                            "file_path": relative_path,
-                            "file_name": file_path.name,
-                            "language": self._get_language_from_extension(file_path.suffix.lower())
-                        }
-                    )
-
-                    doc_batch.append(doc)
-                    total_docs += 1
-                    processed_files += 1
-
-                    # When batch is full, add to vector store
-                    if len(doc_batch) >= BATCH_SIZE:
-                        await loop.run_in_executor(
-                            None,
-                            self.rag_engine.add_documents,
-                            job.collection_name,
-                            doc_batch
-                        )
-                        doc_batch = []  # Clear batch
-
-                    # Update progress periodically
-                    if processed_files % 10 == 0:
-                        metrics = sm.get_state_metrics(OnboardingState.PARSING)
-                        metrics.data["processed_files"] = processed_files
-                        metrics.data["documents_indexed"] = total_docs
-                        self._update_job(job)
-
-                except Exception as e:
-                    print(f"Error reading file {file_path}: {e}")
-                    job.failed_files.append(str(file_path))
-
-            except Exception as e:
-                # Skip failed files, log them
-                job.failed_files.append(str(file_path))
-
-        # Add remaining documents in batch
-        if doc_batch:
-            await loop.run_in_executor(
-                None,
-                self.rag_engine.add_documents,
-                job.collection_name,
-                doc_batch
-            )
-
-        job.total_chunks = total_docs
-
-        sm.complete_state(OnboardingState.PARSING, {
-            "processed_files": processed_files,
-            "documents_indexed": total_docs,
-            "failed_files": len(job.failed_files),
-            "languages": language_counts,
-            "overview_files_collected": len(job.metadata_for_overview)
-        })
-
-        # Transition to overview generation
-        sm.transition_to(OnboardingState.GENERATING_OVERVIEW)
-        self._update_job(job)
 
     async def _handle_generating_overview(self, job: OnboardingJob, sm: OnboardingStateMachine) -> None:
         """
         Handle the overview generation state.
         Uses hybrid approach: file analysis + RAG queries.
         """
+        logger.info(f"Job {job.job_id}: Starting GENERATING_OVERVIEW phase")
         sm.start_state(OnboardingState.GENERATING_OVERVIEW)
         self._update_job(job)
 
@@ -424,21 +266,26 @@ class RepositoryOnboardingService:
             loop = asyncio.get_event_loop()
 
             # Phase 1: File Analysis (already collected during parsing)
+            logger.debug(f"Job {job.job_id}: Phase 1 - Analyzing collected files")
             file_data = await loop.run_in_executor(
                 None,
                 self._analyze_collected_files,
                 job
             )
+            logger.debug(f"Job {job.job_id}: File analysis complete - found {len(file_data)} data points")
 
             # Phase 2: RAG Queries
+            logger.debug(f"Job {job.job_id}: Phase 2 - Querying RAG for insights")
             rag_data = await loop.run_in_executor(
                 None,
                 self._query_rag_for_insights,
                 job.collection_name,
                 file_data
             )
+            logger.debug(f"Job {job.job_id}: RAG queries complete - {len(rag_data)} queries executed")
 
             # Phase 3: LLM Synthesis
+            logger.debug(f"Job {job.job_id}: Phase 3 - Synthesizing overview with LLM")
             overview = await loop.run_in_executor(
                 None,
                 self._synthesize_overview,
@@ -448,6 +295,7 @@ class RepositoryOnboardingService:
             )
 
             job.project_overview = overview
+            logger.info(f"Job {job.job_id}: Overview generated successfully ({len(overview)} characters)")
 
             sm.complete_state(OnboardingState.GENERATING_OVERVIEW, {
                 "overview_length": len(overview),
@@ -456,10 +304,12 @@ class RepositoryOnboardingService:
             })
 
             # Transition to completed
+            logger.info(f"Job {job.job_id}: Transitioning from GENERATING_OVERVIEW to COMPLETED")
             sm.transition_to(OnboardingState.COMPLETED)
             self._update_job(job)
 
         except Exception as e:
+            logger.error(f"Job {job.job_id}: Overview generation failed - {str(e)}", exc_info=True)
             raise OnboardingError(f"Overview generation error: {str(e)}")
 
     def _analyze_collected_files(self, job: OnboardingJob) -> Dict[str, any]:
@@ -469,8 +319,9 @@ class RepositoryOnboardingService:
         Returns:
             Dictionary with extracted information
         """
+        logger.debug(f"Job {job.job_id}: Analyzing {len(job.metadata_for_overview)} metadata files")
         file_data = {
-            "readme_content": None,
+            "readme_content": "",
             "dependencies": [],
             "tech_stack": set(job.languages_detected),
             "config_files": [],
@@ -484,6 +335,7 @@ class RepositoryOnboardingService:
             # Extract README
             if filename_lower.startswith('readme'):
                 file_data["readme_content"] = content[:5000]  # Limit to first 5000 chars
+                logger.debug(f"Job {job.job_id}: Found README: {file_path}")
 
             # Extract dependencies from requirements.txt
             elif filename_lower == 'requirements.txt':
@@ -491,6 +343,7 @@ class RepositoryOnboardingService:
                        for line in content.split('\n')
                        if line.strip() and not line.strip().startswith('#')]
                 file_data["dependencies"].extend(deps[:20])  # Limit to 20
+                logger.debug(f"Job {job.job_id}: Found {len(deps)} dependencies in requirements.txt")
 
             # Extract from package.json
             elif filename_lower == 'package.json':
@@ -504,18 +357,22 @@ class RepositoryOnboardingService:
                     }
                     if "dependencies" in pkg:
                         file_data["dependencies"].extend(list(pkg["dependencies"].keys())[:20])
-                except:
-                    pass
+                    logger.debug(f"Job {job.job_id}: Extracted package.json data for {pkg.get('name', 'unknown')}")
+                except Exception as e:
+                    logger.warning(f"Job {job.job_id}: Failed to parse package.json: {e}")
 
             # Detect frameworks from package files
             elif filename_lower in ['cargo.toml', 'go.mod', 'pom.xml']:
                 file_data["config_files"].append(file_path)
+                logger.debug(f"Job {job.job_id}: Found config file: {file_path}")
 
             # Docker detection
             elif filename_lower == 'dockerfile':
                 file_data["has_docker"] = True
+                logger.debug(f"Job {job.job_id}: Found Dockerfile")
 
         file_data["tech_stack"] = list(file_data["tech_stack"])
+        logger.debug(f"Job {job.job_id}: File analysis complete - tech stack: {file_data['tech_stack']}")
         return file_data
 
     def _query_rag_for_insights(self, collection_name: str, file_data: Optional[Dict] = None) -> Dict[str, str]:
@@ -529,6 +386,7 @@ class RepositoryOnboardingService:
         Returns:
             Dictionary with RAG query results
         """
+        logger.debug(f"Querying RAG engine for collection: {collection_name}")
         rag_data = {}
 
         queries = [
@@ -539,6 +397,7 @@ class RepositoryOnboardingService:
 
         for key, query in queries:
             try:
+                logger.debug(f"Executing RAG query '{key}': {query}")
                 results = self.rag_engine.search(
                     collection_name=collection_name,
                     query=query,
@@ -552,11 +411,15 @@ class RepositoryOnboardingService:
                         for node in results[:3]
                     ])
                     rag_data[key] = formatted
+                    logger.debug(f"RAG query '{key}' returned {len(results)} results")
                 else:
                     rag_data[key] = "Нет данных"
+                    logger.debug(f"RAG query '{key}' returned no results")
             except Exception as e:
                 rag_data[key] = f"Ошибка: {str(e)}"
+                logger.warning(f"RAG query '{key}' failed: {str(e)}", exc_info=True)
 
+        logger.debug("RAG queries completed")
         return rag_data
 
     def _synthesize_overview(self, file_data: Dict, rag_data: Dict, job: OnboardingJob) -> str:
@@ -571,7 +434,10 @@ class RepositoryOnboardingService:
         Returns:
             Generated overview in Russian
         """
+        logger.debug(f"Job {job.job_id}: Synthesizing overview with LLM")
         # Build context for LLM
+        print(file_data)
+        print(file_data.get('readme_content', 'Не найден'))
         context = f"""
 Проанализируй следующую информацию о репозитории и создай структурированный обзор.
 
@@ -622,13 +488,17 @@ Docker: {'Да' if file_data.get('has_docker') else 'Нет'}
 - Используй русский язык
 - Основывайся только на предоставленной информации
 - Если какой-то информации нет, так и напиши"""
-        print(prompt)
+
+        logger.debug(f"Job {job.job_id}: Sending prompt to LLM ({len(prompt)} characters)")
         try:
             # Use RAG engine's LLM (configured in Settings.llm)
             from llama_index.core import Settings
             response = Settings.llm.complete(prompt)
-            return str(response)
+            overview = str(response)
+            logger.debug(f"Job {job.job_id}: LLM synthesis successful ({len(overview)} characters)")
+            return overview
         except Exception as e:
+            logger.error(f"Job {job.job_id}: LLM synthesis failed: {str(e)}", exc_info=True)
             return f"Ошибка генерации обзора: {str(e)}"
 
     def _is_overview_file(self, file_path: Path, repo_path: Path) -> bool:
@@ -720,9 +590,11 @@ Docker: {'Да' if file_data.get('has_docker') else 'Нет'}
             sm: State machine
             error: The exception that occurred
         """
+        logger.error(f"Job {job.job_id}: Handling error - {str(error)}", exc_info=True)
         job.error = str(error)
         sm.transition_to(OnboardingState.FAILED, triggered_by="error")
         self._update_job(job)
+        logger.info(f"Job {job.job_id}: Transitioned to FAILED state")
 
     def get_job_status(self, job_id: str) -> Optional[OnboardingJob]:
         """
@@ -734,7 +606,13 @@ Docker: {'Да' if file_data.get('has_docker') else 'Нет'}
         Returns:
             OnboardingJob or None if not found
         """
-        return self.jobs.get(job_id)
+        logger.debug(f"Retrieving status for job: {job_id}")
+        job = self.jobs.get(job_id)
+        if job:
+            logger.debug(f"Job {job_id} found in state {job.current_state}")
+        else:
+            logger.debug(f"Job {job_id} not found")
+        return job
 
     def list_jobs(self) -> List[OnboardingJob]:
         """
@@ -743,6 +621,7 @@ Docker: {'Да' if file_data.get('has_docker') else 'Нет'}
         Returns:
             List of all jobs
         """
+        logger.debug(f"Listing all jobs - total count: {len(self.jobs)}")
         return list(self.jobs.values())
 
     async def retry_job_async(self, job_id: str) -> OnboardingJob:
@@ -758,13 +637,16 @@ Docker: {'Да' if file_data.get('has_docker') else 'Нет'}
         Raises:
             OnboardingError: If job cannot be retried
         """
+        logger.info(f"Attempting to retry job: {job_id}")
         job = self.get_job_status(job_id)
         if not job:
+            logger.error(f"Cannot retry - job not found: {job_id}")
             raise OnboardingError(f"Job {job_id} not found")
 
         sm = OnboardingStateMachine(job)
 
         if not sm.is_retryable():
+            logger.error(f"Job {job_id} is not retryable (state: {job.current_state}, retries: {job.retry_count}/{job.max_retries})")
             raise OnboardingError(
                 f"Job {job_id} cannot be retried "
                 f"(state: {job.current_state}, retries: {job.retry_count}/{job.max_retries})"
@@ -776,6 +658,7 @@ Docker: {'Да' if file_data.get('has_docker') else 'Нет'}
         # Increment retry count
         job.retry_count += 1
         job.error = None
+        logger.info(f"Job {job_id}: Retry attempt {job.retry_count}/{job.max_retries}, transitioning to {retry_state}")
 
         # Transition to retry state
         sm.transition_to(retry_state, triggered_by="retry")
@@ -799,11 +682,13 @@ Docker: {'Да' if file_data.get('has_docker') else 'Нет'}
         Raises:
             OnboardingError: If job cannot be retried
         """
+        logger.info(f"Scheduling retry for job: {job_id}")
         # Create task in background
         asyncio.create_task(self.retry_job_async(job_id))
 
         # Return current job state
         job = self.get_job_status(job_id)
         if not job:
+            logger.error(f"Job {job_id} not found after scheduling retry")
             raise OnboardingError(f"Job {job_id} not found")
         return job

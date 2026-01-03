@@ -1,40 +1,63 @@
-# LlamaIndex - Core and integrations
-llama-index-core>=0.10.1,<0.11.0
-llama-index-embeddings-gemini>=0.1.0
-llama-index-llms-gemini>=0.1.0
-llama-index-vector-stores-chroma>=0.1.0
+# ===============================
+# LlamaIndex (META PACKAGE)
+# ===============================
+llama-index>=0.10.35,<0.11.0
+
+# Gemini integrations
+llama-index-embeddings-gemini>=0.1.6
+llama-index-llms-gemini>=0.1.3
+
+llama-index-vector-stores-chroma>=0.1.6
+
 llama-index-readers-github>=0.1.9
 
-# Vector database
+llama-index-retrievers-bm25==0.1.3
+
 chromadb==0.4.22
 
-# LLM and embeddings (direct dependencies - may be required by LlamaIndex)
-google-generativeai==0.3.2
+google-generativeai>=0.4.1,<0.6.0
 
-# Data validation and settings
+
+# ===============================
+# Data validation & settings
+# ===============================
 pydantic==2.5.3
 pydantic-settings==2.1.0
 
+
+# ===============================
 # Web UI
+# ===============================
 gradio==4.12.0
 
-# Code syntax highlighting
-pygments==2.17.2
+huggingface_hub>=0.19.0,<0.21.0
 
-# Markdown processing
+# ===============================
+# Code & Markdown processing
+# ===============================
+pygments==2.17.2
 markdown2==2.4.12
 
-# Code parsing
 tree-sitter==0.20.4
 tree-sitter-languages==1.10.2
 
+
+# ===============================
 # Environment variables
+# ===============================
 python-dotenv==1.0.0
 
-# FastAPI framework
+
+# ===============================
+# FastAPI
+# ===============================
 fastapi==0.109.0
 uvicorn[standard]==0.27.0
 
+
+# ===============================
 # Testing (optional)
+# ===============================
 pytest==7.4.3
 pytest-asyncio==0.23.0
+

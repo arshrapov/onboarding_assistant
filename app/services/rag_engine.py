@@ -13,13 +13,14 @@ from llama_index.core import (
     VectorStoreIndex,
     Document,
     Settings,
-    StorageContext,
-    load_index_from_storage
+    StorageContext
 )
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.embeddings.gemini import GeminiEmbedding
 from llama_index.llms.gemini import Gemini
 from llama_index.readers.github import GithubRepositoryReader, GithubClient
+from llama_index.core.storage.docstore import SimpleDocumentStore
+from llama_index.core.query_engine import RetrieverQueryEngine
 import chromadb
 
 # CodeChunk and SearchResult removed - working directly with LlamaIndex Documents
@@ -76,6 +77,7 @@ class RAGEngine:
             api_key=settings.gemini_api_key,
             model_name=settings.embedding_model
         )
+        
 
         # Initialize ChromaDB client
         self.chroma_client = chromadb.PersistentClient(
@@ -152,7 +154,7 @@ class RAGEngine:
                 github_client=github_client,
                 owner=owner,
                 repo=repo_name,
-                use_parser=False,  # Get raw content
+                use_parser=True,  # Get raw content
                 verbose=True,
                 filter_directories=(
                     ["node_modules", ".git", "__pycache__", "venv", ".venv",
@@ -259,6 +261,9 @@ class RAGEngine:
             if not documents:
                 raise ValueError(f"No documents found for {repo_url}")
 
+        docstore = SimpleDocumentStore()
+        docstore.add_documents(documents)
+
         # Create ChromaDB collection
         chroma_collection = self.chroma_client.get_or_create_collection(
             name=collection_name
@@ -266,7 +271,7 @@ class RAGEngine:
 
         # Create vector store
         vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
-        storage_context = StorageContext.from_defaults(vector_store=vector_store)
+        storage_context = StorageContext.from_defaults(vector_store=vector_store, docstore=docstore)
 
         # Build index from documents
         index = VectorStoreIndex.from_documents(
@@ -274,6 +279,14 @@ class RAGEngine:
             storage_context=storage_context,
             show_progress=True
         )
+
+        # Save docstore to disk for later use with BM25Retriever
+        docstore_path = Path(settings.indexes_dir) / f"{collection_name}_docstore.pkl"
+        try:
+            with open(docstore_path, 'wb') as f:
+                pickle.dump(docstore, f)
+        except Exception as e:
+            print(f"Warning: Could not save docstore: {e}")
 
         # Cache index
         self.indexes[collection_name] = index
@@ -298,7 +311,37 @@ class RAGEngine:
         chroma_collection = self.chroma_client.get_collection(name=collection_name)
         vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
 
-        index = VectorStoreIndex.from_vector_store(vector_store)
+        # Load docstore if it exists
+        docstore_path = Path(settings.indexes_dir) / f"{collection_name}_docstore.pkl"
+        docstore = None
+        if docstore_path.exists():
+            try:
+                with open(docstore_path, 'rb') as f:
+                    docstore = pickle.load(f)
+                print(f"DEBUG load_index: Loaded docstore with {len(docstore.get_all_document_hashes())} documents")
+            except Exception as e:
+                import traceback
+                print(f"Warning: Could not load docstore: {e}")
+                print(f"Traceback:\n{traceback.format_exc()}")
+                docstore = None
+        else:
+            print(f"DEBUG load_index: No docstore file found at {docstore_path}")
+
+        # Create index from vector store
+        if docstore is not None:
+            storage_context = StorageContext.from_defaults(
+                vector_store=vector_store,
+                docstore=docstore
+            )
+            index = VectorStoreIndex.from_vector_store(
+                vector_store,
+                storage_context=storage_context
+            )
+            # Manually attach docstore since from_vector_store doesn't preserve it
+            index._docstore = docstore
+            print(f"DEBUG load_index: Manually attached docstore with {len(index.docstore.get_all_document_hashes())} documents")
+        else:
+            index = VectorStoreIndex.from_vector_store(vector_store)
 
         # Cache index
         self.indexes[collection_name] = index
@@ -319,6 +362,11 @@ class RAGEngine:
             self.chroma_client.delete_collection(name=collection_name)
             if collection_name in self.indexes:
                 del self.indexes[collection_name]
+
+            # Delete docstore file if it exists
+            docstore_path = Path(settings.indexes_dir) / f"{collection_name}_docstore.pkl"
+            if docstore_path.exists():
+                docstore_path.unlink()
         except Exception as e:
             print(f"Warning: Could not delete collection {collection_name}: {e}")
 
@@ -403,17 +451,53 @@ class RAGEngine:
         Returns:
             Generated answer
         """
+        from llama_index.core.retrievers import QueryFusionRetriever
+        from llama_index.retrievers.bm25 import BM25Retriever
+
         if top_k is None:
             top_k = settings.top_k_results
 
         # Load index
         index = self.load_index(collection_name)
 
+        # Build list of retrievers - use BM25 only if docstore is available and has documents
+        retrievers = [index.as_retriever(similarity_top_k=top_k)]
+
+        # Check if docstore is available and has documents
+        if hasattr(index, 'docstore') and index.docstore is not None:
+            try:
+                # Try to get documents from docstore to verify it's populated
+                doc_ids = index.docstore.get_all_document_hashes()
+                print(f"DEBUG: Docstore has {len(doc_ids)} documents")
+                if doc_ids and len(doc_ids) > 0:
+                    print(f"DEBUG: Creating BM25 retriever with {len(doc_ids)} documents")
+                    retrievers.append(
+                        BM25Retriever.from_defaults(
+                            docstore=index.docstore, similarity_top_k=top_k
+                        )
+                    )
+                    print("DEBUG: BM25 retriever created successfully")
+                else:
+                    print("Warning: Docstore exists but has no documents, skipping BM25 retriever")
+            except Exception as e:
+                import traceback
+                print(f"Warning: Could not create BM25 retriever: {e}")
+                print(f"Full traceback:\n{traceback.format_exc()}")
+        else:
+            print(f"Warning: No docstore available (has_attr={hasattr(index, 'docstore')}, is_none={index.docstore is None if hasattr(index, 'docstore') else 'N/A'}), using only vector retriever")
+
+        # Create retriever (fusion if we have multiple, otherwise single)
+        if len(retrievers) > 1:
+            retriever = QueryFusionRetriever(
+                retrievers,
+                num_queries=1,
+                use_async=True,
+            )
+        else:
+            retriever = retrievers[0]
+
         # Create query engine
-        query_engine = index.as_query_engine(
-            similarity_top_k=top_k,
-            response_mode="compact"
-        )
+        query_engine = RetrieverQueryEngine(retriever)
 
         # Query
         response = query_engine.query(question)

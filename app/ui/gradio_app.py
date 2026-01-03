@@ -452,10 +452,9 @@ def _create_qa_tab(service: RepositoryOnboardingService) -> None:
             from app.services.rag_engine import RAGEngine
             rag_engine = RAGEngine()
 
-            print(enhanced_question)
             answer = rag_engine.answer_question(
                 collection_name=job.collection_name,
-                question=enhanced_question
+                question=question, # TOOD: we should pass the history and the question to that function 
             )
 
             # Format answer with syntax highlighting and references
