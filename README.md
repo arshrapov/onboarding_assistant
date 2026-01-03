@@ -406,7 +406,7 @@ if status["status"] == "completed":
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `GEMINI_API_KEY` | ✅ Yes | - | Google Gemini API key |
-| `GITHUB_TOKEN` | ❌ No | - | GitHub personal access token |
+| `GITHUB_TOKEN` | ✅ Yes | - | GitHub personal access token |
 | `GEMINI_MODEL` | ❌ No | `models/gemini-2.5-flash` | Gemini model for generation |
 | `EMBEDDING_MODEL` | ❌ No | `models/embedding-001` | Gemini embedding model |
 | `MAX_TOKENS` | ❌ No | `8192` | Max tokens for LLM responses |
